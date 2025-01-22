@@ -11,14 +11,18 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import (
     LlamaConfig, LlamaAttention, LlamaFlashAttention2, LlamaRMSNorm, LlamaMLP, LlamaPreTrainedModel,
     LLAMA_START_DOCSTRING, LLAMA_INPUTS_DOCSTRING, _CONFIG_FOR_DOC,
-    add_start_docstrings, add_start_docstrings_to_model_forward, _prepare_4d_causal_attention_mask_for_sdpa, replace_return_docstrings, apply_rotary_pos_emb, repeat_kv,
+    add_start_docstrings, add_start_docstrings_to_model_forward, _prepare_4d_causal_attention_mask_for_sdpa, 
+    replace_return_docstrings, apply_rotary_pos_emb, repeat_kv, is_flash_attn_2_available,
     _prepare_4d_causal_attention_mask, logger, 
 )
 
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 
 @dataclass
-class BaseModelOutputWithPastAndNorms(ModelOutput):
+class BaseModelOutputWithPast(ModelOutput):
     """
     Base class for model's outputs that may also contain a past key/values (to speed up sequential decoding).
 
@@ -67,7 +71,7 @@ class BaseModelOutputWithPastAndNorms(ModelOutput):
 
 
 @dataclass
-class CausalLMOutputWithPastAndNorms(ModelOutput):
+class CausalLMOutputWithPast(ModelOutput):
     """
     Base class for causal language model (or autoregressive) outputs.
 
@@ -200,20 +204,20 @@ class LlamaAttentionWithOutput(LlamaAttention):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)  # Shape: (B, T, num_heads * head_dim)
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
-            attn_output = self.o_proj(attn_output)
+            attn_output = self.o_proj(attn_output)  # Shape: (B, T, hidden_size)
 
         if not output_attentions:
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value, per_head_output
+    
     
 
 class LlamaSdpaAttentionWithOutput(LlamaAttention):
@@ -294,14 +298,105 @@ class LlamaSdpaAttentionWithOutput(LlamaAttention):
             # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
             is_causal=self.is_causal and attention_mask is None and q_len > 1,
         )
-        per_head_output = attn_output.clone()
-
+        per_head_output = attn_output.clone()  # Shape: (B, num_heads, T, head_dim)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)  # Shape: (B, T, num_heads * head_dim)
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)  # Shape: (B, T, hidden_size)
 
         return attn_output, None, past_key_value, per_head_output
+    
+
+class LlamaFlashAttention2WithOutput(LlamaFlashAttention2):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # LlamaFlashAttention2 attention does not support output_attentions
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+
+            # overwrite attention_mask with padding_mask
+            attention_mask = kwargs.pop("padding_mask")
+
+        output_attentions = False
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # Flash attention requires the input to have the shape
+        # batch_size x seq_length x head_dim x hidden_dim
+        # therefore we just need to keep the original shape
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # to be able to avoid many of these transpose/reshape/view.
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        dropout_rate = self.attention_dropout if self.training else 0.0
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in the correct dtype just to be sure everything works as expected.
+        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+        # in fp32. (LlamaRMSNorm handles it correctly)
+
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            # Handle the case where the model is quantized
+            if hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        )  
+        per_head_output = attn_output.clone() # Shape: (B, num_heads, T, head_dim)
+
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value, per_head_output
     
 
 LLAMA_ATTENTION_CLASSES = {
@@ -309,9 +404,9 @@ LLAMA_ATTENTION_CLASSES = {
     "flash_attention_2": LlamaFlashAttention2,
     "sdpa": LlamaSdpaAttentionWithOutput,
 }
-    
 
-class LlamaDecoderLayerWithOutput(nn.Module):
+
+class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -330,11 +425,6 @@ class LlamaDecoderLayerWithOutput(nn.Module):
         use_cache: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            - Attention head activations.
-            - MLP (FFN) activations.
-        """
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure to use `attention_mask` instead."
@@ -345,7 +435,7 @@ class LlamaDecoderLayerWithOutput(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self-Attention
-        attn_output, self_attn_weights, present_key_value, per_head_output = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, per_head_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -354,13 +444,11 @@ class LlamaDecoderLayerWithOutput(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + attn_output  # Add residual connection
+        hidden_states = residual + hidden_states  # Add residual connection
 
         # Capture attention head L2 norms
-        # attention_activations = attn_output.clone() 
-        # Compute per-head norms (L2 norm over the last dimension, head_dim)
-        # attention_norm = torch.norm(attn_output, p=2, dim=-1)  # L2 norm along the embedding dimension
-        attention_norm = torch.norm(per_head_output, p=2, dim=(-2, -1))  # Shape: (B, num_heads, T, H) -> (B, num_heads)
+        # attention_norm = torch.norm(per_head_output, p=2, dim=(-2, -1))  # Shape: (B, num_heads, T, head_dim) -> (B, num_heads)
+        attention_norm = torch.norm(per_head_output, p=2, dim=-1).mean(dim=-1)  # Shape: (B, num_heads, T, head_dim) -> (B, num_heads)
 
         # Residual connection 2
         residual = hidden_states
@@ -371,16 +459,16 @@ class LlamaDecoderLayerWithOutput(nn.Module):
         hidden_states = residual + mlp_output  # Add residual connection
 
         # Capture MLP L2 norms
-        # mlp_activations = mlp_output.clone()
-        mlp_norm = torch.norm(mlp_output, p=2, dim=1)  # L2 norm -> Shape: (B, hidden_dim)
-
-        outputs = (hidden_states, attention_norm, mlp_norm)
+        mlp_norm = torch.norm(mlp_output, p=2, dim=1)  # L2 norm -> Shape: (B, hidden_size)
+        outputs = (hidden_states, )
 
         if output_attentions:
             outputs += (self_attn_weights,)
 
         if use_cache:
             outputs += (present_key_value,)
+
+        outputs += (attention_norm, mlp_norm)
 
         return outputs
 
@@ -391,7 +479,7 @@ class LlamaDecoderLayerWithOutput(nn.Module):
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaModelWithOutput(LlamaPreTrainedModel):
+class LlamaModel(LlamaPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -406,7 +494,7 @@ class LlamaModelWithOutput(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayerWithOutput(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
@@ -434,7 +522,7 @@ class LlamaModelWithOutput(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPastAndNorms]:
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -530,16 +618,15 @@ class LlamaModelWithOutput(LlamaPreTrainedModel):
                 )
 
             # MODIFICATION: Return attention head activations and MLP activations
-            all_attn_norms += (layer_outputs[1],)
-            all_mlp_norms += (layer_outputs[2],)
-
+            all_attn_norms += (layer_outputs[-2],)
+            all_mlp_norms += (layer_outputs[-1],)
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[4 if output_attentions else 3]
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[3],)
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -552,7 +639,7 @@ class LlamaModelWithOutput(LlamaPreTrainedModel):
             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPastAndNorms(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
@@ -563,12 +650,12 @@ class LlamaModelWithOutput(LlamaPreTrainedModel):
 
 
 
-class LlamaForCausalLMWithOutput(LlamaPreTrainedModel):
+class LlamaForCausalLM(LlamaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModelWithOutput(config)
+        self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -594,7 +681,7 @@ class LlamaForCausalLMWithOutput(LlamaPreTrainedModel):
         return self.model
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=BaseModelOutputWithPastAndNorms, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=BaseModelOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -607,7 +694,7 @@ class LlamaForCausalLMWithOutput(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPastAndNorms]:
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -678,7 +765,7 @@ class LlamaForCausalLMWithOutput(LlamaPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPastAndNorms(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -756,17 +843,19 @@ class LlamaForCausalLMWithOutput(LlamaPreTrainedModel):
 
 
 if __name__ == "__main__":
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     # Load the Llama2-7B model and tokenizer
-    model_name = "meta-llama/Llama-2-7b-hf"  # Replace with the actual model name
+    model_name = "meta-llama/Llama-2-7b-chat-hf"  # Replace with the actual model name
     access_token = "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"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, token=access_token)
-    model = LlamaForCausalLMWithOutput.from_pretrained(model_name, token=access_token)
+    # model = AutoModelForCausalLM.from_pretrained(model_name, token=access_token, device_map="auto")
+    model = LlamaForCausalLM.from_pretrained(model_name, token=access_token, device_map="auto")
+    model.eval()
 
     # Define a sample input
     sample_text = "The quick brown fox jumps over the lazy dog."
-    inputs = tokenizer(sample_text, return_tensors="pt")
-    # inputs = {k: v.to("cuda") for k, v in inputs.items()}  # Move inputs to GPU
+    inputs = tokenizer(sample_text, return_tensors="pt", return_attention_mask=True).to(device)
 
     # Perform the forward pass
     with torch.no_grad():
@@ -776,4 +865,4 @@ if __name__ == "__main__":
         # print(f"Layer {layer} - Attention Norm: {attn_norm.mean().item():.4f}, MLP Norm: {mlp_norm.mean().item():.4f}")
         attn_sparsity = (attn_norm < 1).float().mean().item()
         mlp_sparsity = (mlp_norm < 1).float().mean().item()
-        print(f"Layer {layer} - Attention Norm: {attn_norm.size()} w/ sparsity {attn_sparsity:.4f} (min: {attn_norm.min().item():.4f}, max: {attn_norm.max().item():.4f}), MLP Norm: {mlp_norm.size()} w/ sparsity {mlp_sparsity:.4f} (min: {mlp_norm.min().item():.4f}, max: {mlp_norm.max().item():.4f})")
+        print(f"Layer {layer} - Attention Norm: {attn_norm.shape} w/ sparsity {attn_sparsity:.4f} (min: {attn_norm.min().item():.4f}, max: {attn_norm.max().item():.4f}), MLP Norm: {mlp_norm.shape} w/ sparsity {mlp_sparsity:.4f} (min: {mlp_norm.min().item():.4f}, max: {mlp_norm.max().item():.4f})")
