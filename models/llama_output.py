@@ -220,7 +220,7 @@ class LlamaAttentionWithOutput(LlamaAttention):
     
     
 
-class LlamaSdpaAttentionWithOutput(LlamaAttention):
+class LlamaSdpaAttentionWithOutput(LlamaAttentionWithOutput):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
     `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
@@ -432,7 +432,7 @@ class LlamaDecoderLayer(nn.Module):
 
         # Residual connection 1
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)  # Shape: (B, T, hidden_size)
 
         # Self-Attention
         hidden_states, self_attn_weights, present_key_value, per_head_output = self.self_attn(
@@ -444,7 +444,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states  # Add residual connection
+        hidden_states = residual + hidden_states  # Add residual connection, Shape: (B, T, hidden_size)
 
         # Capture attention head L2 norms
         # attention_norm = torch.norm(per_head_output, p=2, dim=(-2, -1))  # Shape: (B, num_heads, T, head_dim) -> (B, num_heads)
@@ -859,10 +859,16 @@ if __name__ == "__main__":
 
     # Perform the forward pass
     with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
+        outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
 
-    for layer, (attn_norm, mlp_norm) in enumerate(zip(outputs.attention_norms, outputs.mlp_norms)):
+    threshold = 1.0
+    for layer, (attn_norm, mlp_norm, attn_weight) in enumerate(zip(outputs.attention_norms, outputs.mlp_norms, outputs.attentions)):
         # print(f"Layer {layer} - Attention Norm: {attn_norm.mean().item():.4f}, MLP Norm: {mlp_norm.mean().item():.4f}")
-        attn_sparsity = (attn_norm < 1).float().mean().item()
-        mlp_sparsity = (mlp_norm < 1).float().mean().item()
+        attn_sparsity = (attn_norm < threshold).float().mean().item()  # attn_norm (B, num_heads)
+        mlp_sparsity = (mlp_norm < threshold).float().mean().item()  # mlp_norm (B, hidden_size)
         print(f"Layer {layer} - Attention Norm: {attn_norm.shape} w/ sparsity {attn_sparsity:.4f} (min: {attn_norm.min().item():.4f}, max: {attn_norm.max().item():.4f}), MLP Norm: {mlp_norm.shape} w/ sparsity {mlp_sparsity:.4f} (min: {mlp_norm.min().item():.4f}, max: {mlp_norm.max().item():.4f})")
+        print(f"\tAttention weight: {attn_weight.shape}")
+        # Get head_mask (for attention) and neuron_mask (for MLP)
+        head_mask = (attn_norm.mean(dim=0) < threshold).float()  # head_mask (num_heads)
+        neuron_mask = (mlp_norm.mean(dim=0) < threshold).float()  # neuron_mask (hidden_size)
+        print(f"\thead mask: {head_mask.shape}, neuron mask: {neuron_mask.shape}")
