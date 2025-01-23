@@ -455,7 +455,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         # MLP (FFN)
-        mlp_output = self.mlp(hidden_states)
+        mlp_output = self.mlp(hidden_states)  # Shape: (B, T, hidden_size)
         hidden_states = residual + mlp_output  # Add residual connection
 
         # Capture MLP L2 norms
