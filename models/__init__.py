@@ -1,1 +1,1 @@
-from .llama_output import LlamaForCausalLMWithOutput
+from .llama_output import LlamaForCausalLM
