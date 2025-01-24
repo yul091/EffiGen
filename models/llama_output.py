@@ -121,6 +121,7 @@ class LlamaAttentionWithOutput(LlamaAttention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        active_heads: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
@@ -196,6 +197,8 @@ class LlamaAttentionWithOutput(LlamaAttention):
         attn_output = torch.matmul(attn_weights, value_states)  # Shape: (B, num_heads, T, head_dim)
 
         per_head_output = attn_output.clone()
+        if active_heads is not None:
+            attn_output = self._apply_attn_mask(attn_output, active_heads)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -219,6 +222,15 @@ class LlamaAttentionWithOutput(LlamaAttention):
         return attn_output, attn_weights, past_key_value, per_head_output
     
     
+    def _apply_attn_mask(self, attn_output, active_heads):
+        # print(f"[Layer {self.self_attn.layer_idx}] Masking attn neurons: active neurons: {self.active_neurons.shape}, sparsity: {1 - self.active_neurons.shape[0] / self.hidden_size}")
+        # Mask inactive neurons by zeroing out their activations
+        mask = torch.zeros_like(attn_output, device=attn_output.device)  # Shape: (B, num_heads, T, head_dim)
+        # mask[:, :, self.active_neurons] = 1
+        mask[:, active_heads, :, :] = 1 # Mask inactive heads by zeroing out their activations
+        return attn_output * mask
+    
+    
 
 class LlamaSdpaAttentionWithOutput(LlamaAttentionWithOutput):
     """
@@ -236,6 +248,7 @@ class LlamaSdpaAttentionWithOutput(LlamaAttentionWithOutput):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        active_heads: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -299,6 +312,9 @@ class LlamaSdpaAttentionWithOutput(LlamaAttentionWithOutput):
             is_causal=self.is_causal and attention_mask is None and q_len > 1,
         )
         per_head_output = attn_output.clone()  # Shape: (B, num_heads, T, head_dim)
+        if active_heads is not None:
+            attn_output = self._apply_attn_mask(attn_output, active_heads)
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)  # Shape: (B, T, num_heads * head_dim)
 
@@ -307,7 +323,7 @@ class LlamaSdpaAttentionWithOutput(LlamaAttentionWithOutput):
         return attn_output, None, past_key_value, per_head_output
     
 
-class LlamaFlashAttention2WithOutput(LlamaFlashAttention2):
+class LlamaFlashAttention2WithOutput(LlamaFlashAttention2, LlamaAttentionWithOutput):
 
     def forward(
         self,
@@ -317,6 +333,7 @@ class LlamaFlashAttention2WithOutput(LlamaFlashAttention2):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        active_heads: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         # LlamaFlashAttention2 attention does not support output_attentions
@@ -389,6 +406,8 @@ class LlamaFlashAttention2WithOutput(LlamaFlashAttention2):
             query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
         )  
         per_head_output = attn_output.clone() # Shape: (B, num_heads, T, head_dim)
+        if active_heads is not None:
+            attn_output = self._apply_attn_mask(attn_output, active_heads)
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -401,7 +420,7 @@ class LlamaFlashAttention2WithOutput(LlamaFlashAttention2):
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttentionWithOutput,
-    "flash_attention_2": LlamaFlashAttention2,
+    "flash_attention_2": LlamaFlashAttention2WithOutput,
     "sdpa": LlamaSdpaAttentionWithOutput,
 }
 
@@ -414,6 +433,9 @@ class LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Instantiate active neurons (initially all neurons are active)
+        self.active_heads = None
+        self.active_neurons = None
 
     def forward(
         self,
@@ -442,8 +464,10 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            active_heads=self.active_heads,
             **kwargs,
         )
+
         hidden_states = residual + hidden_states  # Add residual connection, Shape: (B, T, hidden_size)
 
         # Capture attention head L2 norms
@@ -456,6 +480,10 @@ class LlamaDecoderLayer(nn.Module):
 
         # MLP (FFN)
         mlp_output = self.mlp(hidden_states)  # Shape: (B, T, hidden_size)
+        # Apply MLP neuron masking: if active neurons is not full
+        if self.active_neurons is not None:
+            mlp_output = self._apply_mlp_mask(mlp_output, self.active_neurons)
+
         hidden_states = residual + mlp_output  # Add residual connection
 
         # Capture MLP L2 norms
@@ -471,6 +499,14 @@ class LlamaDecoderLayer(nn.Module):
         outputs += (attention_norm, mlp_norm)
 
         return outputs
+    
+
+    def _apply_mlp_mask(self, mlp_output, active_neurons):
+        # print(f"[Layer {self.self_attn.layer_idx}] Masking MLP neurons: active neurons: {active_neurons.shape}, sparsity: {1 - active_neurons.shape[0] / self.hidden_size}")
+        # Mask inactive neurons by zeroing out their activations
+        mask = torch.zeros_like(mlp_output, device=mlp_output.device)  # Shape: (B, T, hidden_size)
+        mask[:, :, active_neurons] = 1
+        return mlp_output * mask
 
 
 
@@ -509,6 +545,11 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def reset_sparsity(self):
+        for layer in self.layers:
+            layer.active_heads = None
+            layer.active_neurons = None
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
@@ -862,6 +903,7 @@ if __name__ == "__main__":
         outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
 
     threshold = 1.0
+    sparsity = 0.8
     for layer, (attn_norm, mlp_norm, attn_weight) in enumerate(zip(outputs.attention_norms, outputs.mlp_norms, outputs.attentions)):
         # print(f"Layer {layer} - Attention Norm: {attn_norm.mean().item():.4f}, MLP Norm: {mlp_norm.mean().item():.4f}")
         attn_sparsity = (attn_norm < threshold).float().mean().item()  # attn_norm (B, num_heads)
@@ -872,3 +914,18 @@ if __name__ == "__main__":
         head_mask = (attn_norm.mean(dim=0) < threshold).float()  # head_mask (num_heads)
         neuron_mask = (mlp_norm.mean(dim=0) < threshold).float()  # neuron_mask (hidden_size)
         print(f"\thead mask: {head_mask.shape}, neuron mask: {neuron_mask.shape}")
+
+        # Rank reverse and keep (1-sparsity) proportion of heads and neurons
+        _, attn_ranks = torch.sort(attn_norm.mean(dim=0), descending=True)  # attn_ranks (num_heads)
+        _, mlp_ranks = torch.sort(mlp_norm.mean(dim=0), descending=True)  # mlp_ranks (hidden_size)
+        active_attn_heads = attn_ranks[: round((1 - sparsity) * attn_ranks.shape[0])]  
+        active_mlp_neurons = mlp_ranks[: round((1 - sparsity) * mlp_ranks.shape[0])]
+
+        # Modify and enable sparse model
+        model.model.layers[layer].active_neurons = active_mlp_neurons
+
+
+    # Perform the forward pass
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
+        # print(f"Sparse loss: {outputs.loss}")
