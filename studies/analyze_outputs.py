@@ -10,7 +10,7 @@ from collections import defaultdict
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from models import LlamaForCausalLM
-from tasks import compute_perplexity
+from tasks import compute_perplexity, compute_QA_accuracy
 
 
 def get_sparse_tensor(tensor: torch.Tensor, sparsity: float, min_elements_per_row: int = 1) -> torch.Tensor:
@@ -80,10 +80,15 @@ def main(args):
 
     elif args.task == "QA":
         # OpenBookQA dataset
-        openbookqa = load_dataset("openbookqa", split="test")
-        openbookqa_samples = min(num_samples, len(openbookqa))
-        openbookqa = openbookqa.select(range(openbookqa_samples)).filter(lambda x: x["question"].strip())
+        openbookqa = load_dataset("allenai/openbookqa", split="test")
+        openbookqa_samples = min(100, len(openbookqa))
+        openbookqa = openbookqa.filter(lambda x: x["question_stem"].strip()).select(range(openbookqa_samples))
         dataset = openbookqa
+
+        # Evaluate accuracy
+        metrics = compute_QA_accuracy(model, dataset, tokenizer)
+        print(f"[Dense model] Accuracy: {metrics['accuracy']:.2f}")
+        results['accuracy (dense)'] = metrics["accuracy"]
     else:
         raise ValueError(f"Invalid task: {args.task}")
 
@@ -96,17 +101,33 @@ def main(args):
     # dataset = wiki.concatenate(c4)
 
     # Tokenize dataset
-    def tokenize_function(example):
-        return tokenizer(example["text"], truncation=True, padding=True, max_length=max_length)
+    if args.task == "language_modeling":
+        def tokenize_function(example):
+            return tokenizer(example["text"], truncation=True, padding=True, max_length=max_length)
+        
+        tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        
+    elif args.task == "QA":
+        def tokenize_function(example):
+            question = example["question_stem"]
+            choices = example["choices"]["text"]
+            labels = example["choices"]["label"]
 
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+            # Format the input prompt
+            formatted_choices = "\n".join([f"{label}. {choice}" for label, choice in zip(labels, choices)])
+            prompt = f"Question: {question}\nChoices:\n{formatted_choices}\nAnswer:"
 
-    # Prepare data loader
+            # Tokenize the prompt
+            tokenized = tokenizer(prompt, truncation=True, padding=True, max_length=max_length)
+            return tokenized
+        
+        tokenized_dataset = dataset.map(tokenize_function, batched=False, remove_columns=dataset.column_names)
+
     def data_collator(batch):
         return {
-            "input_ids": torch.stack([torch.tensor(x["input_ids"]) for x in batch]),
-            "attention_mask": torch.stack([torch.tensor(x["attention_mask"]) for x in batch]),
-        }
+        "input_ids": torch.stack([torch.tensor(x["input_ids"]) for x in batch]),
+        "attention_mask": torch.stack([torch.tensor(x["attention_mask"]) for x in batch]),
+    }
 
     dataloader = torch.utils.data.DataLoader(
         tokenized_dataset, batch_size=batch_size, collate_fn=data_collator,
@@ -142,17 +163,18 @@ def main(args):
 
     # Instantiate a average attention output norm matrix (num_layers, num_heads)
     avg_attn_norms, avg_mlp_norms = [], []
+    sparsity_dict = {}
     for layer in tqdm.tqdm(layerwise_attn_output_norms):
         attn_output_norms = torch.cat(layerwise_attn_output_norms[layer], dim=0)  # shape: (N, num_heads)
         mlp_output_norms = torch.cat(layerwise_mlp_output_norms[layer], dim=0)  # shape: (N, hidden_dim)
         attn_weights = torch.cat([attn_weight[:, :, :min_seq_len, :min_seq_len] for attn_weight in layerwise_attn_weights[layer]], dim=0)  # shape: (N, num_heads, T, T)
         # print(f"Layer {layer}: attn_output_norms {attn_output_norms.shape}, mlp_output_norm {mlp_output_norms.shape}, attn_weights {attn_weights.shape}")
-        # results[layer] = {"attn_sparsity": {}, "mlp_sparsity": {}}
-        # for sparsity_threshold in [0.1, 0.5, 1.0, 2.0, 5.0]:
-        #     attn_sparsity = (attn_output_norms <= sparsity_threshold).float().mean().item()
-        #     mlp_sparsity = (mlp_output_norms <= sparsity_threshold).float().mean().item()
-        #     results[layer]["attn_sparsity"][sparsity_threshold] = attn_sparsity
-        #     results[layer]["mlp_sparsity"][sparsity_threshold] = mlp_sparsity
+        sparsity_dict[layer] = {"attn_sparsity": {}, "mlp_sparsity": {}}
+        for sparsity in [0.1, 0.5, 1.0, 2.0, 5.0]:
+            attn_sparsity = (attn_output_norms <= sparsity).float().mean().item()
+            mlp_sparsity = (mlp_output_norms <= sparsity).float().mean().item()
+            sparsity_dict[layer]["attn_sparsity"][sparsity] = attn_sparsity
+            sparsity_dict[layer]["mlp_sparsity"][sparsity] = mlp_sparsity
 
         # Save tensor to disk
         torch.save(attn_weights, f"{output_dir}/layer-{layer}_attn-weights.pt")
@@ -160,6 +182,10 @@ def main(args):
         torch.save(attn_output_norms, f"{output_dir}/layer-{layer}_norms-attn.pt")
         avg_attn_norms.append(attn_output_norms.mean(dim=0))  # shape: (num_heads)
         avg_mlp_norms.append(mlp_output_norms.mean(dim=0))  # shape: (hidden_dim)
+
+    # Save results to json
+    with open(f"{output_dir}/layerwise_norms.json", "w") as f:
+        json.dump(sparsity_dict, f, indent=4)
 
     # Save average norms
     avg_attn_norms = torch.stack(avg_attn_norms, dim=0)  # shape: (num_layers, num_heads)
@@ -172,12 +198,7 @@ def main(args):
         # sparse_attn_norms = get_sparse_tensor(avg_attn_norms, sparsity)  # shape: (num_layers, num_heads)
         # sparse_mlp_norms = get_sparse_tensor(avg_mlp_norms, sparsity)  # shape: (num_layers, hidden_dim)
 
-        # # [Layer-wise] Rank reverse and keep (1 - sparsity) proportion of heads and neurons
-        # _, attn_ranks = torch.sort(attn_output_norms.mean(dim=0), descending=True)  # attn_ranks (num_heads)
-        # _, mlp_ranks = torch.sort(mlp_output_norms.mean(dim=0), descending=True)  # mlp_ranks (hidden_size)
-        # active_attn_heads = attn_ranks[: round((1 - sparsity) * attn_ranks.shape[0])]  
-        # active_mlp_neurons = mlp_ranks[: round((1 - sparsity) * mlp_ranks.shape[0])]
-
+        # [Layer-wise] Rank reverse and keep (1 - sparsity) proportion of heads and neurons
         # for layer, (layer_attn, layer_mlp) in enumerate(zip(sparse_attn_norms, sparse_mlp_norms)):
         for layer, (attn_norm, mlp_norm) in enumerate(zip(avg_attn_norms, avg_mlp_norms)):
             if pruning_target == "attn" or pruning_target == "all":
@@ -185,34 +206,45 @@ def main(args):
                 _, attn_ranks = torch.sort(attn_norm, descending=True)  # attn_ranks (num_heads)
                 active_attn_heads = attn_ranks[: round((1 - sparsity) * attn_ranks.shape[0])]
                 model.model.layers[layer].active_heads = active_attn_heads
-                print(f"[After pruning] Layer {layer} active_attn_heads: {active_attn_heads.shape[0]}")
+                # print(f"[After pruning] Layer {layer} active_attn_heads: {active_attn_heads.shape[0]}")
             if pruning_target == "mlp" or pruning_target == "all":
                 # active_mlp_neurons = torch.nonzero(layer_mlp, as_tuple=True)[0]
                 _, mlp_ranks = torch.sort(mlp_norm, descending=True)  # mlp_ranks (hidden_size)
                 active_mlp_neurons = mlp_ranks[: round((1 - sparsity) * mlp_ranks.shape[0])]
                 model.model.layers[layer].active_neurons = active_mlp_neurons
-                print(f"[After pruning] Layer {layer} active_mlp_neurons: {active_mlp_neurons.shape[0]}")
+                # print(f"[After pruning] Layer {layer} active_mlp_neurons: {active_mlp_neurons.shape[0]}")
 
-        # Evaluate perplexity
-        predictions = dataset["text"]
-        metrics = compute_perplexity(predictions, tokenizer, model, batch_size=5, max_length=max_length)
+        # Evaluate metrics
+        if args.task == "language_modeling":
+            predictions = dataset["text"]
+            metrics = compute_perplexity(predictions, tokenizer, model, batch_size=5, max_length=max_length)
+            if pruning_target == "mlp":
+                print(f'perplexities (MLP-sparse-{sparsity:.1f}): ', [round(x, 2) for x in metrics["perplexities"]])
+                print(f'mean perplexity (MLP-sparse-{sparsity:.1f}): ', round(metrics["mean_perplexity"], 2)) 
+                results[f'perplexity (MLP-sparse-{sparsity:.1f})'] = metrics["mean_perplexity"]
+            elif pruning_target == "attn":
+                print(f'perplexities (ATTN-sparse-{sparsity:.1f}): ', [round(x, 2) for x in metrics["perplexities"]])
+                print(f'mean perplexity (ATTN-sparse-{sparsity:.1f}): ', round(metrics["mean_perplexity"], 2)) 
+                results[f'perplexity (ATTN-sparse-{sparsity:.1f})'] = metrics["mean_perplexity"]
+            else:
+                print(f'perplexities (sparse-{sparsity:.1f}): ', [round(x, 2) for x in metrics["perplexities"]])
+                print(f'mean perplexity (sparse-{sparsity:.1f}): ', round(metrics["mean_perplexity"], 2)) 
+                results[f'perplexity (sparse-{sparsity:.1f})'] = metrics["mean_perplexity"]
+        elif args.task == "QA":
+            metrics = compute_QA_accuracy(model, dataset, tokenizer)
+            if pruning_target == "mlp":
+                print(f"Accuracy (MLP-sparse-{sparsity:.1f}): {metrics['accuracy']:.2f}")
+                results[f"accuracy (MLP-sparse-{sparsity:.1f})"] = metrics["accuracy"]
+            elif pruning_target == "attn":
+                print(f"Accuracy (ATTN-sparse-{sparsity:.1f}): {metrics['accuracy']:.2f}")
+                results[f"accuracy (ATTN-sparse-{sparsity:.1f})"] = metrics["accuracy"]
+            else:
+                print(f"Accuracy (sparse-{sparsity:.1f}): {metrics['accuracy']:.2f}")
+                results[f"accuracy (sparse-{sparsity:.1f})"] = metrics["accuracy"]
+
         model.model.reset_sparsity()  # Reset sparsity
-        if pruning_target == "mlp":
-            print(f'perplexities (MLP-sparse-{sparsity}): ', [round(x, 2) for x in metrics["perplexities"]])
-            print(f'mean perplexity (MLP-sparse-{sparsity}): ', round(metrics["mean_perplexity"], 2)) 
-            results[f'perplexity (MLP-sparse-{sparsity})'] = metrics["mean_perplexity"]
-        elif pruning_target == "attn":
-            print(f'perplexities (ATTN-sparse-{sparsity}): ', [round(x, 2) for x in metrics["perplexities"]])
-            print(f'mean perplexity (ATTN-sparse-{sparsity}): ', round(metrics["mean_perplexity"], 2)) 
-            results[f'perplexity (ATTN-sparse-{sparsity})'] = metrics["mean_perplexity"]
-        else:
-            print(f'perplexities (sparse-{sparsity}): ', [round(x, 2) for x in metrics["perplexities"]])
-            print(f'mean perplexity (sparse-{sparsity}): ', round(metrics["mean_perplexity"], 2)) 
-            results[f'perplexity (sparse-{sparsity})'] = metrics["mean_perplexity"]
+        
 
-    # Save results to json
-    # with open(f"{output_dir}/eval_metrics.json", "w") as f:
-    #     json.dump(results, f, indent=4)
     json_file_path = f"{output_dir}/eval_metrics.json"
     if os.path.exists(json_file_path):
         with open(json_file_path, "r") as f:
@@ -232,10 +264,10 @@ if __name__ == "__main__":
     parser.add_argument("--access_token", type=str, default="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")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=100)
-    parser.add_argument("--task", type=str, default="language_modeling", choices=["language_modeling", "QA"])
+    parser.add_argument("--task", type=str, default="QA", choices=["language_modeling", "QA"])
     # parser.add_argument("--sparsity", type=float, default=0.2)
     parser.add_argument("--save_intermediate_outputs", action="store_true")
-    parser.add_argument("--pruning_target", type=str, default="all", choices=["attn", "mlp", "all"])
+    parser.add_argument("--pruning_target", type=str, default="mlp", choices=["attn", "mlp", "all"])
 
     args = parser.parse_args()
 
