@@ -2,7 +2,7 @@
 max_capacity_prompts=128
 export CUDA_LAUNCH_BLOCKING=1
 
-devices=(2 3 4 5 6 7 8)
+devices=(0 1 2 3 4 5 6 7 8)
 head_choices=('reason') #  copy, reason
 betas=(1.005 1.01 1.1 1.2 1.5 2 5 10)
 counter=0

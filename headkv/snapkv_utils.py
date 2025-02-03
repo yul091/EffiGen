@@ -386,7 +386,7 @@ class ReasonSnapKVCluster():
 
         total_pool_capacity = (self.base_capacity // self.beta) * self.num_hidden_layers * self.num_attention_heads
         min_num = (self.base_capacity - self.base_capacity // self.beta)
-        self.initial_head_capacity = torch.round(self.total_attention * total_pool_capacity + min_num).int()
+        self.head_capacity = torch.round(self.total_attention * total_pool_capacity + min_num).int()
             
     def calcul_attn_sore(self, key_states, query_states):
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -559,7 +559,7 @@ class ReasonNormKVCluster(ReasonSnapKVCluster):
         # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
         _device = key_states.device
         bsz, num_heads, q_len, head_dim = query_states.shape
-        attn_score= self.calcul_attn_sore(key_states, query_states, value_states)
+        attn_score= self.calcul_attn_sore(key_states, query_states)
         origin_heads_key_states = torch.split(key_states, 1, dim=1)
         origin_heads_value_states = torch.split(value_states, 1, dim=1)
 
