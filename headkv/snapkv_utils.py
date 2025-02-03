@@ -99,6 +99,82 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
+
+def reallocate_capacity(layer_head_capacity: torch.Tensor, attention_norm: torch.Tensor = None, strategy: str = 'reverse_norm') -> torch.Tensor:
+    """
+    Reallocate capacity among heads based on a given strategy.
+
+    Args:
+        layer_head_capacity (torch.Tensor): Tensor of shape (num_heads) containing the current head capacities.
+        attention_norm (torch.Tensor): Tensor of shape (bsz, num_heads) containing attention norms.
+        strategy (str): Strategy for reallocation. Options are 'norm' or 'random'.
+
+    Returns:
+        torch.Tensor: Tensor of shape (num_heads) containing the reallocated capacities.
+    """
+    total_capacity = layer_head_capacity.sum().item()
+    num_heads = layer_head_capacity.shape[0]
+
+    if strategy == 'norm':
+        # Normalize attention norms across heads (small norms will result in larger capacities)
+        avg_attn_norm = attention_norm.mean(dim=0)  # shape: (num_heads)
+        normalized_attn_norm = avg_attn_norm / avg_attn_norm.sum(dim=-1, keepdim=True)  # shape: (num_heads)
+        inverse_norms = 1 / (normalized_attn_norm + 1e-8)  # shape: (num_heads)
+        
+        # Normalize the inverse norms to determine the reallocation weights
+        realloc_weights = inverse_norms / inverse_norms.sum(dim=-1, keepdim=True)  # shape: (num_heads)
+        reallocated_capacity = total_capacity * realloc_weights  # Scale by total capacity
+
+        # Round to integers and ensure the total matches
+        reallocated_capacity = torch.floor(reallocated_capacity).int()
+        difference = total_capacity - reallocated_capacity.sum().item()
+        for _ in range(difference):
+            idx = torch.argmax(realloc_weights).item()
+            reallocated_capacity[idx] += 1
+
+        return reallocated_capacity
+    
+    elif strategy == 'reverse_norm':
+        # Compute average attention norms across the batch
+        avg_attn_norm = attention_norm.mean(dim=0)  # shape: (num_heads)
+        alloc_weights = avg_attn_norm / avg_attn_norm.sum(dim=-1, keepdim=True)  # shape: (num_heads)
+        
+        # Allocate capacity proportionally to weights
+        reallocated_capacity = total_capacity * alloc_weights  # Scale by total capacity
+
+        # Round to integers and ensure the total matches
+        reallocated_capacity = torch.floor(reallocated_capacity).int()
+        difference = total_capacity - reallocated_capacity.sum().item()
+        for _ in range(difference):
+            idx = torch.argmax(alloc_weights).item()  # Allocate the leftover capacity to the most significant head
+            reallocated_capacity[idx] += 1
+
+        return reallocated_capacity
+
+    elif strategy == 'random':
+        # Initialize random weights for allocation
+        random_weights = torch.rand(num_heads, device=layer_head_capacity.device)  # shape: (num_heads)
+        random_weights /= random_weights.sum(dim=-1, keepdim=True)  # Normalize weights
+
+        # Allocate capacity randomly while ensuring each head has at least a capacity of 1
+        reallocated_capacity = random_weights * (total_capacity - num_heads)  # Subtract minimum capacity for each head
+        reallocated_capacity = torch.floor(reallocated_capacity).int() + 1  # Add minimum capacity of 1 to each head
+
+        # Adjust for rounding errors to ensure total capacity matches
+        difference = total_capacity - reallocated_capacity.sum().item()
+        for _ in range(difference):
+            idx = torch.randint(0, num_heads, (1,), device=layer_head_capacity.device)
+            reallocated_capacity[idx] += 1
+
+        return reallocated_capacity
+
+    else:
+        raise ValueError(f"Unsupported strategy: {strategy}. Use 'norm' or 'random'.")
+
+
+
+
 class SnapKVCluster():
     def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20):
         self.window_size = window_size
