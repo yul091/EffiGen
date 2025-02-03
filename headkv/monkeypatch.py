@@ -1,3 +1,5 @@
+import sys 
+sys.dont_write_bytecode = True
 from importlib.metadata import version
 import warnings
 import transformers
