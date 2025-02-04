@@ -332,9 +332,10 @@ if __name__ == "__main__":
         )
 
     if args.method.lower() != 'fullkv':
-        from headkv.monkeypatch import replace_llama, replace_mistral 
+        from headkv.monkeypatch import replace_llama, replace_mistral, replace_mixtral 
         replace_llama(args.method)
         replace_mistral(args.method)
+        replace_mixtral(args.method)
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
