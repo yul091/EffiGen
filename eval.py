@@ -36,6 +36,7 @@ def parse_args(args=None):
     parser.add_argument('--results_dir', type=str, default=None)
     parser.add_argument('--model', type=str, default='meta-llama-3-8b-instruct')
     parser.add_argument('--capacity', type=int, default=128)
+    parser.add_argument('--method', type=str, default='ReasonKV')
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
     return parser.parse_args(args)
 
@@ -87,7 +88,7 @@ if __name__ == '__main__':
     
     results_list = [
         ["dataset"],
-        ["ReasonKV"],
+        [args.method],
     ]
     total_scores = []
 
@@ -95,9 +96,8 @@ if __name__ == '__main__':
         
         results_list[0].append(dataset)
         
-        for idx, method in enumerate(["ReasonKV"]):
+        for idx, method in enumerate([args.method]):
             try:
-                args.method = method
                 args.dataset = dataset
                 args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
                 

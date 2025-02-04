@@ -101,80 +101,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 
-def reallocate_capacity(layer_head_capacity: torch.Tensor, attention_norm: torch.Tensor = None, strategy: str = 'reverse_norm') -> torch.Tensor:
-    """
-    Reallocate capacity among heads based on a given strategy.
-
-    Args:
-        layer_head_capacity (torch.Tensor): Tensor of shape (num_heads) containing the current head capacities.
-        attention_norm (torch.Tensor): Tensor of shape (bsz, num_heads) containing attention norms.
-        strategy (str): Strategy for reallocation. Options are 'norm' or 'random'.
-
-    Returns:
-        torch.Tensor: Tensor of shape (num_heads) containing the reallocated capacities.
-    """
-    total_capacity = layer_head_capacity.sum().item()
-    num_heads = layer_head_capacity.shape[0]
-
-    if strategy == 'norm':
-        # Normalize attention norms across heads (small norms will result in larger capacities)
-        avg_attn_norm = attention_norm.mean(dim=0)  # shape: (num_heads)
-        normalized_attn_norm = avg_attn_norm / avg_attn_norm.sum(dim=-1, keepdim=True)  # shape: (num_heads)
-        inverse_norms = 1 / (normalized_attn_norm + 1e-8)  # shape: (num_heads)
-        
-        # Normalize the inverse norms to determine the reallocation weights
-        realloc_weights = inverse_norms / inverse_norms.sum(dim=-1, keepdim=True)  # shape: (num_heads)
-        reallocated_capacity = total_capacity * realloc_weights  # Scale by total capacity
-
-        # Round to integers and ensure the total matches
-        reallocated_capacity = torch.floor(reallocated_capacity).int()
-        difference = total_capacity - reallocated_capacity.sum().item()
-        for _ in range(difference):
-            idx = torch.argmax(realloc_weights).item()
-            reallocated_capacity[idx] += 1
-
-        return reallocated_capacity
-    
-    elif strategy == 'reverse_norm':
-        # Compute average attention norms across the batch
-        avg_attn_norm = attention_norm.mean(dim=0)  # shape: (num_heads)
-        alloc_weights = avg_attn_norm / avg_attn_norm.sum(dim=-1, keepdim=True)  # shape: (num_heads)
-        
-        # Allocate capacity proportionally to weights
-        reallocated_capacity = total_capacity * alloc_weights  # Scale by total capacity
-
-        # Round to integers and ensure the total matches
-        reallocated_capacity = torch.floor(reallocated_capacity).int()
-        difference = total_capacity - reallocated_capacity.sum().item()
-        for _ in range(difference):
-            idx = torch.argmax(alloc_weights).item()  # Allocate the leftover capacity to the most significant head
-            reallocated_capacity[idx] += 1
-
-        return reallocated_capacity
-
-    elif strategy == 'random':
-        # Initialize random weights for allocation
-        random_weights = torch.rand(num_heads, device=layer_head_capacity.device)  # shape: (num_heads)
-        random_weights /= random_weights.sum(dim=-1, keepdim=True)  # Normalize weights
-
-        # Allocate capacity randomly while ensuring each head has at least a capacity of 1
-        reallocated_capacity = random_weights * (total_capacity - num_heads)  # Subtract minimum capacity for each head
-        reallocated_capacity = torch.floor(reallocated_capacity).int() + 1  # Add minimum capacity of 1 to each head
-
-        # Adjust for rounding errors to ensure total capacity matches
-        difference = total_capacity - reallocated_capacity.sum().item()
-        for _ in range(difference):
-            idx = torch.randint(0, num_heads, (1,), device=layer_head_capacity.device)
-            reallocated_capacity[idx] += 1
-
-        return reallocated_capacity
-
-    else:
-        raise ValueError(f"Unsupported strategy: {strategy}. Use 'norm' or 'random'.")
-
-
-
-
 class SnapKVCluster():
     def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20):
         self.window_size = window_size
@@ -568,7 +494,7 @@ class ReasonSnapKVCluster():
 
 class ReasonNormKVCluster(ReasonSnapKVCluster):
 
-    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',base_capacity=None, head_choice=None, beta=None, temp=None, layer_idx = None, num_hidden_layers = None, num_attention_heads=None, model=None):
+    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',base_capacity=None, beta=None, temp=None, layer_idx = None, num_hidden_layers = None, num_attention_heads=None, model=None):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -588,48 +514,65 @@ class ReasonNormKVCluster(ReasonSnapKVCluster):
         self.cu_headlens = None
 
         # Set fixed head capacity with shape (num_hidden_layers, num_attention_heads)
-        self.initial_head_capacity = torch.round(torch.ones((self.num_hidden_layers, self.num_attention_heads)) * (self.base_capacity)).int()
         # print(f"Initial head capacities for layer {self.layer_idx} (sum={self.initial_head_capacity[self.layer_idx].sum()}, shape={self.initial_head_capacity[self.layer_idx].shape}): {self.initial_head_capacity[self.layer_idx]}")
-        self.head_capacity = self.initial_head_capacity.clone()
+        self.head_capacity = torch.round(torch.ones((self.num_hidden_layers, self.num_attention_heads)) * (self.base_capacity)).int()
+        # self.total_capacity = self.initial_head_capacity[0].sum().item()
+        self.total_capacity = self.num_attention_heads * self.base_capacity
 
-    # def calcul_attn_sore(self, key_states, query_states, value_states):
-    #     bsz, num_heads, q_len, head_dim = query_states.shape
-    #     attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
-    #     mask = torch.full(
-    #         (self.window_size, self.window_size), 
-    #         torch.finfo(attn_weights.dtype).min,
-    #         device=attn_weights.device,
-    #     )
-    #     mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-    #     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-    #     mask = mask.to(attn_weights.device)
-    #     attention_mask = mask[None, None, :, :]
-    #     attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
-    #     # Compute softmax of attention weights
-    #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    #     # Compute the L1 norm of the value states
-    #     value_norms = value_states.norm(p=1, dim=-1)  # Shape: [bsz, num_heads, seq_len]
-    #     # Combine attention weights with value norms
-    #     combined_scores = attn_weights * value_norms[:, :, None, :]  # Broadcast value_norms to match attn_weights
-    #     combined_scores_mean = combined_scores[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
-    #     # attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
-    #     if self.pooling == 'avgpool':
-    #         attn_weights_mean_pooling = F.avg_pool1d(
-    #             combined_scores_mean, 
-    #             kernel_size=self.kernel_size,
-    #             padding=self.kernel_size // 2,
-    #             stride=1,
-    #         )
-    #     elif self.pooling == 'maxpool':
-    #         attn_weights_mean_pooling = F.max_pool1d(
-    #             combined_scores_mean, 
-    #             kernel_size=self.kernel_size,
-    #             padding=self.kernel_size // 2,
-    #             stride=1,
-    #         )
-    #     else:
-    #         raise ValueError('Pooling method not supported')
-    #     return attn_weights_mean_pooling  # shape: [bsz, num_heads, q_len]
+    
+    def reallocate_capacity(
+        self,
+        attention_norm: torch.Tensor = None, 
+        strategy: str = 'norm',
+    ) -> torch.Tensor:
+        """
+        Reallocate capacity among heads based on a given strategy.
+
+        Args:
+            layer_head_capacity (torch.Tensor): Tensor of shape (num_heads) containing the current head capacities.
+            strategy (str): Strategy for reallocation. Options are 'norm' or 'random'.
+
+        Returns:
+            torch.Tensor: Tensor of shape (num_heads) containing the reallocated capacities.
+        """
+        
+        if strategy == 'norm':
+            # Compute average attention norms across the batch
+            avg_attn_norm = attention_norm.mean(dim=0)  # shape: (num_heads)
+            alloc_weights = avg_attn_norm / avg_attn_norm.sum(dim=-1, keepdim=True)  # shape: (num_heads)
+            
+            # Allocate capacity proportionally to weights
+            reallocated_capacity = self.total_capacity * alloc_weights  # Scale by total capacity
+
+            # Round to integers and ensure the total matches
+            reallocated_capacity = torch.floor(reallocated_capacity).int()
+            difference = self.total_capacity - reallocated_capacity.sum().item()
+            for _ in range(difference):
+                idx = torch.argmax(alloc_weights).item()  # Allocate the leftover capacity to the most significant head
+                reallocated_capacity[idx] += 1
+
+            return reallocated_capacity
+
+        elif strategy == 'random':
+            # Initialize random weights for allocation
+            random_weights = torch.rand(self.num_attention_heads, device=attention_norm.device)  # shape: (num_heads)
+            random_weights /= random_weights.sum(dim=-1, keepdim=True)  # Normalize weights
+
+            # Allocate capacity randomly while ensuring each head has at least a capacity of 1
+            reallocated_capacity = random_weights * (self.total_capacity - self.num_attention_heads)  # Subtract minimum capacity for each head
+            reallocated_capacity = torch.floor(reallocated_capacity).int() + 1  # Add minimum capacity of 1 to each head
+
+            # Adjust for rounding errors to ensure total capacity matches
+            difference = self.total_capacity - reallocated_capacity.sum().item()
+            for _ in range(difference):
+                idx = torch.randint(0, self.num_attention_heads, (1,), device=attention_norm.device)
+                reallocated_capacity[idx] += 1
+
+            return reallocated_capacity
+
+        else:
+            raise ValueError(f"Unsupported strategy: {strategy}. Use 'norm' or 'random'.")
+
 
     def update_kv(self, key_states, query_states, value_states):
         # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
@@ -779,7 +722,6 @@ def init_reason_normkv(self):
     assert hasattr(self.config,'kernel_size'),"kernel_size not set"
     assert hasattr(self.config,"pooling"),"pooling not set"
     assert hasattr(self.config, "base_capacity"), "base_capacity not set"
-    assert hasattr(self.config, 'head_choice'), "head_choice not set"
     assert hasattr(self.config, 'beta'), "beta not set"
     assert hasattr(self.config, 'temp'), 'temp not set'
 
@@ -788,7 +730,6 @@ def init_reason_normkv(self):
         self.kv_cluster = ReasonNormKVCluster(
             window_size = self.config.window_size,
             base_capacity=self.config.base_capacity,
-            head_choice=self.config.head_choice,
             beta=self.config.beta,
             temp=self.config.temp,
             kernel_size = self.config.kernel_size,

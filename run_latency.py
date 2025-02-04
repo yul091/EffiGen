@@ -75,12 +75,11 @@ def set_seed(seed):
 
 def main(args):
     model_path = args.model_path.lower()
-    lengths = [10, 50, 100, 500, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000]
-    output_max_len = args.length
+    max_output_lengths = [10, 50, 100, 500, 1_000, 2_000, 3_000, 4_000, 5_000,]
     model_name = model_path.split("/")[-1]
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
-    memory_fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_memory.json"), "w")
+    memory_fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_latency.json"), "w")
 
     data_dir = 'reason_needle/babilong-100examples/64k/qa1/'
     file = os.path.join(data_dir, 'data-00000-of-00001.arrow')
@@ -89,35 +88,36 @@ def main(args):
     for i in range(4):
         all_prompt += dataset[i]['input'] + '\n'
     tokens = tokenizer.tokenize(all_prompt)
+    context = cut_context(tokens, length=10_000, tokenizer=tokenizer)
+    # print(f"Context: {context}")
+    inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to("cuda")
+    batch_input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+    context_length = batch_input_ids.shape[-1]
+    args.result_data['context_length'] = context_length
 
-    pbar = tqdm(total=len(lengths))
-    for index, length in enumerate(lengths):
-        context = cut_context(tokens, length=length, tokenizer=tokenizer)
-        # print(f"Context: {context}")
-        inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to("cuda")
-        batch_input_ids = inputs.input_ids
-        attention_mask = inputs.attention_mask
-        context_length = batch_input_ids.shape[-1]
-        max_memory_allocated_after_input_to_cuda = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
-        args.result_data[f"{context_length}:after_input_to_cuda"] = f"{max_memory_allocated_after_input_to_cuda} GB"
+    model.model.config.window_size = 8
+    model.model.config.base_capacity = args.max_capacity_prompts
+    model.model.config.aug_capacity = args.aug_capacity
+    model.model.config.head_choice = args.head_choice
+    model.model.config.top_num = args.top_num
+    model.model.config.beta = args.beta
+    model.model.config.temp = args.temp
+    model.model.config.alpha = args.alpha
+    model.model.config.kernel_size = 7
+    model.model.config.skip = 0
+    model.model.config.normalize = True
+    model.model.config.pooling = "maxpool"
+    model.model.config.floor = 0.2
+    model.model.config.pyram_beta = args.pyram_beta
+
+
+    pbar = tqdm(total=len(max_output_lengths))
+
+    for index, output_max_len in enumerate(max_output_lengths):
 
         # max_memory_reserved_after_input_to_cuda = get_max_memory_reserved(all_devices) / (1024 * 1024 * 1024)
         # args.result_data[f"{haystack_size}:max_memory_reserved_after_input_to_cuda"] = f"{max_memory_reserved_after_input_to_cuda} GB"
-                
-        model.model.config.window_size = 8
-        model.model.config.base_capacity = args.max_capacity_prompts
-        model.model.config.aug_capacity = args.aug_capacity
-        model.model.config.head_choice = args.head_choice
-        model.model.config.top_num = args.top_num
-        model.model.config.beta = args.beta
-        model.model.config.temp = args.temp
-        model.model.config.alpha = args.alpha
-        model.model.config.kernel_size = 7
-        model.model.config.skip = 0
-        model.model.config.normalize = True
-        model.model.config.pooling = "maxpool"
-        model.model.config.floor = 0.2
-        model.model.config.pyram_beta = args.pyram_beta
 
         start_time = time.perf_counter()
         output = model.generate(
@@ -131,28 +131,9 @@ def main(args):
             eos_token_id=[tokenizer.eos_token_id]
         )
         end_time = time.perf_counter()
-
-        max_memory_allocated_after_generate = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
-        args.result_data[f"{context_length}:after_generate"] = f"{max_memory_allocated_after_generate} GB"
-        args.result_data[f'{context_length}:time'] = end_time - start_time
-        # import gc
-        # gpu_tensors = [obj for obj in gc.get_objects() if torch.is_tensor(obj) and obj.is_cuda]
-        
-        # print(f"Number of tensors on GPU: {len(gpu_tensors)}")
-        # for i, tensor in enumerate(gpu_tensors):
-        #     print(f"Tensor {i}: shape {tensor.shape}, dtype {tensor.dtype}")
-        
-        # 通过 get_referrers() 追踪变量名
-        # for tensor in gpu_tensors:
-        #     referrers = gc.get_referrers(tensor)
-        #     for ref in referrers:
-        #         if isinstance(ref, dict):
-        #             for var_name, var_value in ref.items():
-        #                 if var_value is tensor:
-        #                     print(f"Tensor name: {var_name}, Tensor shape: {tensor.shape}")
-        # ipdb.set_trace()
-        # max_memory_reserved_after_generate = get_max_memory_reserved(all_devices) / (1024 * 1024 * 1024)
-        # args.result_data[f"{haystack_size}:max_memory_reserved_after_generate"] = f"{max_memory_reserved_after_generate} GB"
+        # Calculate the actually output token length
+        output_length = output.shape[-1] - context_length
+        args.result_data[f'{output_length}:time'] = end_time - start_time
 
         batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
         torch.cuda.empty_cache()
@@ -200,7 +181,6 @@ if __name__ == "__main__":
     parser.add_argument('--temp', type=float, default=1.0)
     parser.add_argument('--alpha', type=float, default=1, help='should be [0, 1]. 1-- total copy.')
     parser.add_argument('--pyram_beta', type=float, default=20)
-    parser.add_argument('--length', type=int, default=1)
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
@@ -233,10 +213,10 @@ if __name__ == "__main__":
         args.model_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        device_map="auto",
+        # device_map="auto",
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation
-    )
+    ).to("cuda")
     
 
     args.result_data = {}
@@ -264,7 +244,6 @@ if __name__ == "__main__":
         
         print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx}/{len(datasets)}")
         print(f'base capacity: {args.max_capacity_prompts}\thead_choice:{args.head_choice}\tbeta:{args.beta}\ttemp:{args.temp}\talpha:{args.alpha}')
-
         args.dataset = dataset
         
         # args.data_file = f"/mnt/users/t-yufu/HeadAllocation_share_2/data/LongBench/{args.dataset}.jsonl"

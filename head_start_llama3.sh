@@ -1,7 +1,7 @@
 ######################################## For Longbench
 max_capacity_prompts=128
 export CUDA_LAUNCH_BLOCKING=1
-
+method=NormKV  # AdativeKV, ReasonKV, NormKV, fullkv
 devices=(0 1 2 3 4 5 6 7 8)
 head_choices=('reason') #  copy, reason
 betas=(1.005 1.01 1.1 1.2 1.5 2 5 10)
@@ -16,13 +16,13 @@ mkdir -p longbench_logs
 #         temp=1
 #         nohup bash head_base.sh \
 #             $device \
-#             ReasonKV \
+#             $method \
 #             ${max_capacity_prompts} \
 #             flash_attention_2 \
 #             meta-llama/Meta-Llama-3-8B-Instruct \
 #             $head_choice \
 #             $beta \
-#             $temp > ./longbench_logs/llama3_ReasonKV-consistent_${head_choice}_base${max_capacity_prompts}_temp${temp}.txt 2>&1 &
+#             $temp > ./longbench_logs/llama3_${method}-consistent_${head_choice}_base${max_capacity_prompts}_temp${temp}.txt 2>&1 &
 #         ((counter+=1))
 #     done
 # done
@@ -34,7 +34,7 @@ for ((i=0; i<1; i++)); do
         temp=1
         bash head_base.sh \
             $device \
-            ReasonKV \
+            $method \
             ${max_capacity_prompts} \
             flash_attention_2 \
             meta-llama/Meta-Llama-3-8B-Instruct \
