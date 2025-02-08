@@ -9,7 +9,7 @@ import warnings
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa, \
     _prepare_4d_causal_attention_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.mixtral.modeling_mixtral import (
     apply_rotary_pos_emb,
     repeat_kv,
@@ -50,9 +50,13 @@ def adaptive_MixtralModel_forward(
     use_cache: Optional[bool] = None,
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
+    output_router_logits: Optional[bool] = None,
     return_dict: Optional[bool] = None,
-) -> Union[Tuple, BaseModelOutputWithPast]:
+) -> Union[Tuple, MoeModelOutputWithPast]:
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_router_logits = (
+        output_router_logits if output_router_logits is not None else self.config.output_router_logits
+    )
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
@@ -136,6 +140,7 @@ def adaptive_MixtralModel_forward(
     # decoder layers
     all_hidden_states = () if output_hidden_states else None
     all_self_attns = () if output_attentions else None
+    all_router_logits = () if output_router_logits else None
     next_decoder_cache = None
 
     for decoder_layer in self.layers:
@@ -150,6 +155,7 @@ def adaptive_MixtralModel_forward(
                 position_ids,
                 past_key_values,
                 output_attentions,
+                output_router_logits,
                 use_cache,
             )
         else:
@@ -159,6 +165,7 @@ def adaptive_MixtralModel_forward(
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 use_cache=use_cache,
             )
 
@@ -169,6 +176,9 @@ def adaptive_MixtralModel_forward(
 
         if output_attentions:
             all_self_attns += (layer_outputs[1],)
+
+        if output_router_logits:
+                all_router_logits += (layer_outputs[-1],)
 
     hidden_states = self.norm(hidden_states)
 
@@ -181,12 +191,13 @@ def adaptive_MixtralModel_forward(
         next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
 
     if not return_dict:
-        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-    return BaseModelOutputWithPast(
+        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits] if v is not None)
+    return MoeModelOutputWithPast(
         last_hidden_state=hidden_states,
         past_key_values=next_cache,
         hidden_states=all_hidden_states,
         attentions=all_self_attns,
+        router_logits=all_router_logits,
     )
 
 
