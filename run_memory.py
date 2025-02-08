@@ -75,7 +75,7 @@ def set_seed(seed):
 
 def main(args):
     model_path = args.model_path.lower()
-    lengths = [10, 50, 100, 500, 1_000, 5_000, 10_000, 20_000, 30_000, 50_000]
+    lengths = [1000, 2000, 4000, 8000, 16000, 32000, 64000,]
     output_max_len = args.length
     model_name = model_path.split("/")[-1]
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
