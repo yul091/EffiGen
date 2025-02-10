@@ -3,15 +3,12 @@
 export CUDA_LAUNCH_BLOCKING=1
 method=NormKV  # AdativeKV, ReasonKV, NormKV, fullkv
 # devices=(0 1 2 3 4 5 6 7 8)
-head_choice='reason' #  copy, reason
-betas=(1.005 1.01 1.1 1.2 1.5 2 5 10)
+head_choice='reason' # copy, reason
 # counter=0
-model_path=meta-llama/Meta-Llama-3-8B-Instruct
+model_path=allenai/OLMoE-1B-7B-0924
 # Create longbench_logs directory if it does not exist
 mkdir -p longbench_logs
 device=0
-beta=${betas[0]}
-temp=1
 attn_implementation=flash_attention_2
 
 export CUDA_VISIBLE_DEVICES=$device
@@ -35,8 +32,8 @@ python3 run_longbench.py \
     --method ${method} \
     --model_path ${model_path} \
     --head_choice ${head_choice} \
-    --beta ${beta} \
-    --temp ${temp} \
+    --beta 1.001 \
+    --temp 1 \
     --attn_implementation ${attn_implementation} \
     --save_dir ${save_dir} \
     --use_cache True

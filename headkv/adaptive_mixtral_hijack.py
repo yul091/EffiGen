@@ -13,7 +13,7 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.mixtral.modeling_mixtral import (
     apply_rotary_pos_emb,
     repeat_kv,
-    MixtralFlashAttention2,
+    MixtralAttention,
 )
 from transformers.utils import (
     logging,
@@ -203,7 +203,7 @@ def adaptive_MixtralModel_forward(
 
 
 def adaptive_mixtral_flash_attn2_forward(
-    self: MixtralFlashAttention2,
+    self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
@@ -554,7 +554,7 @@ def reason_mixtral_flash_attn2_forward(
 
 
 def norm_mixtral_flash_attn2_forward(
-    self: MixtralFlashAttention2,
+    self: MixtralAttention,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,

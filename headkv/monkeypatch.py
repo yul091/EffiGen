@@ -12,10 +12,11 @@ from headkv.adaptive_mixtral_hijack import prepare_inputs_for_generation_mixtral
 
 from headkv.fixed_llama_hijack import pyramidkv_llama_flash_attn2_forward, fixed_llama_flash_attn2_forward, fixed_LlamaModel_forward
 from headkv.fixed_llama_hijack import prepare_inputs_for_generation_llama as fixed_prepare_inputs_for_generation_llama
-from headkv.adaptive_llama_hijack import reason_llama_flash_attn2_forward, adaptive_llama_flash_attn2_forward,adaptive_LlamaModel_forward, norm_llama_flash_attn2_forward
+from headkv.adaptive_llama_hijack import reason_llama_flash_attn2_forward, adaptive_llama_flash_attn2_forward,adaptive_LlamaModel_forward, norm_llama_flash_attn2_forward, norm_llama_mlp_forward, norm_llama_decoder_layer_forward
 from headkv.adaptive_llama_hijack import prepare_inputs_for_generation_llama as ada_prepare_inputs_for_generation_llama
 from headkv.fixed_mixtral_hijack import pyramidkv_mixtral_flash_attn2_forward, fixed_mixtral_flash_attn2_forward, fixed_MixtralModel_forward
 from headkv.fixed_mixtral_hijack import prepare_inputs_for_generation_mixtral as fixed_prepare_inputs_for_generation_mixtral
+from headkv.adaptive_olmoe_hijack import norm_olmoe_mlp_forward, norm_olmoe_sparse_block_forward, norm_olmoe_decoder_layer_forward
 
 
 def check_version():
@@ -70,6 +71,12 @@ def replace_mixtral_adaptive():
     transformers.models.mixtral.modeling_mixtral.MixtralModel.forward = adaptive_MixtralModel_forward
 
 
+def replace_olmoe(method):
+    if method == 'NormKV':
+        transformers.models.olmoe.modeling_olmoe.OlmoeMLP.forward = norm_olmoe_mlp_forward
+        transformers.models.olmoe.modeling_olmoe.OlmoeSparseMoeBlock.forward = norm_olmoe_sparse_block_forward
+        transformers.models.olmoe.modeling_olmoe.OlmoeDecoderLayer.forward = norm_olmoe_decoder_layer_forward
+
 
 
 def replace_mistral(method):
@@ -119,6 +126,8 @@ def replace_llama(method):
         transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_llama
         transformers.models.llama.modeling_llama.LlamaModel.forward = adaptive_LlamaModel_forward
         transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = norm_llama_flash_attn2_forward
+        transformers.models.llama.modeling_llama.LlamaMLP.forward = norm_llama_mlp_forward
+        transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = norm_llama_decoder_layer_forward
 
 
 def replace_mixtral(method):

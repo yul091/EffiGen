@@ -2,3 +2,4 @@ profile_results
 figures
 *logs
 results*
+*.lprof

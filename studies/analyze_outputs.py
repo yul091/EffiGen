@@ -205,13 +205,13 @@ def main(args):
                 # active_attn_heads = torch.nonzero(layer_attn, as_tuple=True)[0]
                 _, attn_ranks = torch.sort(attn_norm, descending=True)  # attn_ranks (num_heads)
                 active_attn_heads = attn_ranks[: round((1 - sparsity) * attn_ranks.shape[0])]
-                model.model.layers[layer].active_heads = active_attn_heads
+                model.model.layers[layer].active_heads = active_attn_heads  # shape: (active_heads)
                 # print(f"[After pruning] Layer {layer} active_attn_heads: {active_attn_heads.shape[0]}")
             if pruning_target == "mlp" or pruning_target == "all":
                 # active_mlp_neurons = torch.nonzero(layer_mlp, as_tuple=True)[0]
                 _, mlp_ranks = torch.sort(mlp_norm, descending=True)  # mlp_ranks (hidden_size)
                 active_mlp_neurons = mlp_ranks[: round((1 - sparsity) * mlp_ranks.shape[0])]
-                model.model.layers[layer].active_neurons = active_mlp_neurons
+                model.model.layers[layer].active_neurons = active_mlp_neurons  # shape: (active_neurons)
                 # print(f"[After pruning] Layer {layer} active_mlp_neurons: {active_mlp_neurons.shape[0]}")
 
         # Evaluate metrics
