@@ -13,7 +13,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.mistral.modeling_mistral import (
     apply_rotary_pos_emb,
     repeat_kv,
-    MistralFlashAttention2,
+    MistralAttention,
 )
 from transformers.utils import (
     logging,
@@ -543,7 +543,7 @@ def reason_mistral_flash_attn2_forward(
 
 
 def norm_mistral_flash_attn2_forward(
-    self: MistralFlashAttention2,
+    self: MistralAttention,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,

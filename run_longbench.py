@@ -88,6 +88,7 @@ model2maxlen = {
     "llama3": 7950,
     "llama-3": 7950,
     "mistral": 31500,
+    "olmoe": 3950,
 }
 
 
@@ -140,7 +141,7 @@ def main(args):
             
 
     
-    output_max_len = dataset2maxlen[args.dataset]
+    output_max_len = dataset2maxlen[args.dataset] if args.max_new_tokens is None else args.max_new_tokens
     
     with open(args.data_file) as fp:
         for line in fp:
@@ -332,10 +333,16 @@ if __name__ == "__main__":
         )
 
     if args.method.lower() != 'fullkv':
-        from headkv.monkeypatch import replace_llama, replace_mistral, replace_mixtral 
-        replace_llama(args.method)
-        replace_mistral(args.method)
-        replace_mixtral(args.method)
+        from headkv.monkeypatch import (
+            # replace_llama, 
+            # replace_mistral, 
+            # replace_mixtral,
+            replace_olmoe,
+        ) 
+        # replace_llama(args.method)
+        # replace_mistral(args.method)
+        # replace_mixtral(args.method)
+        replace_olmoe(args.method)
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
