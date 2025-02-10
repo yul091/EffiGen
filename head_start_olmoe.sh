@@ -9,7 +9,7 @@ model_path=allenai/OLMoE-1B-7B-0924
 # Create longbench_logs directory if it does not exist
 mkdir -p longbench_logs
 device=0
-attn_implementation=flash_attention_2
+attn_implementation=eager  # flash_attention_2
 
 export CUDA_VISIBLE_DEVICES=$device
 # for max_capacity_prompts in 128 256 512 1024; do 
@@ -28,7 +28,8 @@ export CUDA_VISIBLE_DEVICES=$device
 
 # For fullkv only
 save_dir="./results/${method}/results_long_bench"
-python3 run_longbench.py \
+# python3 run_longbench.py \
+kernprof -l -v run_longbench.py \
     --method ${method} \
     --model_path ${model_path} \
     --head_choice ${head_choice} \
