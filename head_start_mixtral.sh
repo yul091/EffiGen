@@ -2,12 +2,12 @@
 
 max_capacity_prompts=128
 export CUDA_LAUNCH_BLOCKING=1
-method=AdativeKV  # AdativeKV, ReasonKV, NormKV, fullkv
+method=ReasonKV  # AdativeKV, ReasonKV, NormKV, fullkv
 # devices=(0 1 2 3 4 5 6 7 8)
 head_choice='reason' #  copy, reason
 betas=(1.005 1.01 1.1 1.2 1.5 2 5 10)
 # counter=0
-model_path=mistralai/Mixtral-8x7B-v0.1
+model_path=mistralai/Mixtral-8x7B-Instruct-v0.1  # mistralai/Mixtral-8x7B-v0.1
 # Create longbench_logs directory if it does not exist
 mkdir -p longbench_logs
 # device=5
@@ -17,9 +17,9 @@ attn_implementation=flash_attention_2
 
 # export CUDA_VISIBLE_DEVICES=$device
 # for max_capacity_prompts in 128 256 512 1024; do
-for method in AdativeKV; do
-    save_dir="./results/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
-    python3 run_longbench.py \
+# for method in fullkv; do
+save_dir="./results/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
+python3 run_longbench.py \
     --method ${method} \
     --model_path ${model_path} \
     --max_capacity_prompts ${max_capacity_prompts} \
@@ -29,7 +29,7 @@ for method in AdativeKV; do
     --attn_implementation ${attn_implementation} \
     --save_dir ${save_dir} \
     --use_cache True
-done
+# done
 
 
 

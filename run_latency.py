@@ -88,7 +88,7 @@ def main(args):
     for i in range(4):
         all_prompt += dataset[i]['input'] + '\n'
     tokens = tokenizer.tokenize(all_prompt)
-    context = cut_context(tokens, length=10_000, tokenizer=tokenizer)
+    context = cut_context(tokens, length=20_000, tokenizer=tokenizer)
     # print(f"Context: {context}")
     inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to("cuda")
     batch_input_ids = inputs.input_ids
@@ -204,10 +204,16 @@ if __name__ == "__main__":
         )
 
     if args.method.lower() != 'fullkv':
-        from headkv.monkeypatch import replace_llama, replace_mistral, replace_mixtral 
+        from headkv.monkeypatch import (
+            replace_llama, 
+            replace_mistral, 
+            replace_mixtral,
+            # replace_olmoe,
+        ) 
         replace_llama(args.method)
         replace_mistral(args.method)
         replace_mixtral(args.method)
+        # replace_olmoe(args.method)
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
@@ -218,7 +224,6 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation
     ).to("cuda")
     
-
     args.result_data = {}
 
     tokenizer.padding_side = "left"

@@ -30,20 +30,9 @@ export CUDA_VISIBLE_DEVICES=$device
 # done
 
 # For fullkv only
-save_dir="./results/${method}/results_long_bench"
-python3 run_longbench.py \
-    --method ${method} \
-    --model_path ${model_path} \
-    --head_choice ${head_choice} \
-    --beta ${beta} \
-    --temp ${temp} \
-    --attn_implementation ${attn_implementation} \
-    --save_dir ${save_dir} \
-    --use_cache True
-
-
-# kernprof -l -v run_longbench.py \
-#      --method ${method} \
+# save_dir="./results/${method}/results_long_bench"
+# python3 run_longbench.py \
+#     --method ${method} \
 #     --model_path ${model_path} \
 #     --head_choice ${head_choice} \
 #     --beta ${beta} \
@@ -51,6 +40,17 @@ python3 run_longbench.py \
 #     --attn_implementation ${attn_implementation} \
 #     --save_dir ${save_dir} \
 #     --use_cache True
+
+save_dir="./results/${method}/results_long_bench"
+kernprof -l -v run_longbench.py \
+     --method ${method} \
+    --model_path ${model_path} \
+    --head_choice ${head_choice} \
+    --beta ${beta} \
+    --temp ${temp} \
+    --attn_implementation ${attn_implementation} \
+    --save_dir ${save_dir} \
+    --use_cache True
 
 #     for ((j=0; j<1; j++)); do
 #         device=0

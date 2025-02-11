@@ -103,12 +103,13 @@ if __name__ == '__main__':
                 
                 
                 scores = dict()
-                predictions, answers, lengths = [], [], []
+                predictions, answers, lengths, output_lengths = [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
                             data = json.loads(line)
                             predictions.append(data["pred"])
+                            output_lengths.append(data["output_length"])
                             answers.append(data["answers"])
                             all_classes = data["all_classes"]
                             if "length" in data:
@@ -122,6 +123,7 @@ if __name__ == '__main__':
                     if args.dataset == 'qasper':
                         score_e = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
                 scores[args.dataset] = score
+                scores[f"{args.dataset}_output_length"] = np.mean(output_lengths)
                     
                 output_dir = os.path.dirname(args.eval_file)
                 

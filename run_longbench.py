@@ -243,7 +243,8 @@ def main(args):
         )
 
 
-        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)        
+        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)   
+        output_length = output[0].shape[0] - context_length     
         batch_generations = batch_outputs
 
         torch.cuda.empty_cache()
@@ -256,6 +257,7 @@ def main(args):
             example["context"] = batch_contexts[j]
             example["answers"] = batch_answerss[j]
             example["pred"] = batch_generations[j]
+            example["output_length"] = output_length
             example["length"] = batch_lengths[j]
             
             example["dataset"] = batch_datasets[j]
@@ -334,15 +336,15 @@ if __name__ == "__main__":
 
     if args.method.lower() != 'fullkv':
         from headkv.monkeypatch import (
-            # replace_llama, 
-            # replace_mistral, 
-            # replace_mixtral,
-            replace_olmoe,
+            replace_llama, 
+            replace_mistral, 
+            replace_mixtral,
+            # replace_olmoe,
         ) 
-        # replace_llama(args.method)
-        # replace_mistral(args.method)
-        # replace_mixtral(args.method)
-        replace_olmoe(args.method)
+        replace_llama(args.method)
+        replace_mistral(args.method)
+        replace_mixtral(args.method)
+        # replace_olmoe(args.method)
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
