@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from transformers.cache_utils import Cache
 from transformers.utils import logging, is_flash_attn_2_available
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.activations import ACT2FN
 from transformers.models.olmoe.modeling_olmoe import (
     OlmoeAttention,
     OlmoeMLP,
@@ -202,19 +202,117 @@ def norm_olmoe_mlp_forward(
     neuron_mask: Optional[torch.BoolTensor] = None,
 ):
     if neuron_mask is not None:
+        if x.numel() == 0:
+            return x
         x_masked = x[:, neuron_mask]  # Shape: (X * B, H')
 
-        # Gate projection
-        gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (X * B, intermediate_size)
-        up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (X * B, intermediate_size)
+        # # Gate projection
+        # gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (X * B, intermediate_size)
+        # up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (X * B, intermediate_size)
 
-        # Down projection
-        down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight)  # Shape: (X * B, H)
+        # # Down projection
+        # down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight)  # Shape: (X * B, H)
+        try:
+            down_proj = self.down_proj_masked(self.act_fn(self.gate_proj_masked(x_masked)) * self.up_proj_masked(x_masked))
+        except:
+            print(f"x {x.shape}, x_masked {x_masked.shape}, neuron_mask {neuron_mask.sum().item()}, gate_proj_masked {self.gate_proj_masked.weight.shape}, up_proj_masked {self.up_proj_masked.weight.shape}, down_proj_masked {self.down_proj_masked.weight.shape}")
 
     else:
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
     
     return down_proj
+
+# class OlmoeMLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+#         self.act_fn = ACT2FN[config.hidden_act]
+
+#         # Generate a random mask across the neurons (hidden size)
+#         self.sparsity = 0.5
+#         # Ensure 50% of the neurons are kept, by ranking and selecting the top 50% of the neurons
+#         self.neuron_mask = torch.randperm(self.hidden_size) < int(self.sparsity * self.hidden_size)
+#         # self.create_indexed_weights(self.neuron_mask)
+#         h_prime = self.neuron_mask.sum().item()  # The reduced input dimension H'
+#         dtype = self.gate_proj.weight.dtype
+#         self.gate_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype)
+#         self.up_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype)
+#         self.down_proj_masked = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=dtype)
+#         with torch.no_grad():
+#             # Assign the masked weights
+#             self.gate_proj_masked.weight.copy_(self.gate_proj.weight[:, self.neuron_mask])
+#             self.up_proj_masked.weight.copy_(self.up_proj.weight[:, self.neuron_mask])
+#             self.down_proj_masked.weight.copy_(self.down_proj.weight)
+
+#     def forward(self, x, neuron_mask: Optional[torch.BoolTensor] = None,):
+#         if neuron_mask is not None:
+#             x_masked = x[:, neuron_mask]  # Shape: (X * B, H')
+
+#             # # Gate projection
+#             # gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (X * B, intermediate_size)
+#             # up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (X * B, intermediate_size)
+
+#             # # Down projection
+#             # down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight)  # Shape: (X * B, H)
+#             down_proj = self.down_proj_masked(self.act_fn(self.gate_proj_masked(x_masked)) * self.up_proj_masked(x_masked))
+
+#         else:
+#             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    
+#         return down_proj
+
+def create_indexed_weights(
+    self: OlmoeMLP, 
+    neuron_mask: torch.BoolTensor,
+):
+    """
+    Create indexed weights based on neuron_mask and move them to GPU.
+    This avoids repeated indexing overhead during inference.
+    """
+    h_prime = neuron_mask.sum().item()  # The reduced input dimension H'
+    self.original_device = self.gate_proj.weight.device
+    dtype = self.gate_proj.weight.dtype
+
+    # Create new Linear layers with modified input size
+    self.gate_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
+    self.up_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
+    self.down_proj_masked = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=dtype).to(self.original_device)
+
+    with torch.no_grad():
+        # Assign the masked weights
+        self.gate_proj_masked.weight.copy_(self.gate_proj.weight[:, neuron_mask])
+        self.up_proj_masked.weight.copy_(self.up_proj.weight[:, neuron_mask])
+        self.down_proj_masked.weight.copy_(self.down_proj.weight)
+
+    # # Offload the original weights to CPU
+    # self.gate_proj.to("cpu")
+    # self.up_proj.to("cpu")
+    # self.down_proj.to("cpu")
+
+
+# def update_indexed_weights(
+#     self: OlmoeMLP, 
+#     neuron_mask: torch.BoolTensor,
+# ):
+#     """
+#     Create indexed weights based on neuron_mask and move them to GPU.
+#     This avoids repeated indexing overhead during inference.
+#     """
+#     with torch.no_grad():
+#         # Assign the masked weights
+#         self.gate_proj_masked.weight.copy_(self.gate_proj.weight[:, neuron_mask])
+#         self.up_proj_masked.weight.copy_(self.up_proj.weight[:, neuron_mask])
+#         self.down_proj_masked.weight.copy_(self.down_proj.weight)
+
+    # # Offload the original weights to CPU
+    # self.gate_proj.to("cpu")
+    # self.up_proj.to("cpu")
+    # self.down_proj.to("cpu")
 
 
 
@@ -262,6 +360,7 @@ def norm_olmoe_sparse_block_forward(
     return final_hidden_states, router_logits
 
 
+
 @profile
 def norm_olmoe_decoder_layer_forward(
     self: OlmoeDecoderLayer,
@@ -300,11 +399,15 @@ def norm_olmoe_decoder_layer_forward(
     hidden_states = self.post_attention_layernorm(hidden_states)
     # hidden_states, router_logits = self.mlp(hidden_states)  # 32%
     if phase == "prefilling":
-        hidden_states, router_logits = self.mlp(hidden_states)
+        hidden_states, router_logits = self.mlp(hidden_states, )
         mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
-        sparsity = 0.2  # keep (1-sparsity) of the neurons
+        sparsity = 0.5
         self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
-        # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+        print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+        for expert in self.mlp.experts:
+            if not hasattr(expert, 'gate_proj_masked'):
+                create_indexed_weights(expert, self.neuron_mask)
+
         if self.self_attn.layer_idx == 0:
             print(f"[prefilling] last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
             self.decode_step = 1

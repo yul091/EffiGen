@@ -675,30 +675,10 @@ def norm_llama_mlp_forward(
     neuron_mask: Optional[torch.BoolTensor] = None,
 ):
     if neuron_mask is not None:
-        # # Directly call the original forward function
-        # if self.config.pretraining_tp > 1:
-        #     slice = self.intermediate_size // self.config.pretraining_tp
-        #     gate_proj_slices = self.gate_proj_masked.weight.split(slice, dim=0)
-        #     up_proj_slices = self.up_proj_masked.weight.split(slice, dim=0)
-        #     down_proj_slices = self.down_proj_masked.weight.split(slice, dim=1)
-
-        #     gate_proj = torch.cat(
-        #         [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-        #     )
-        #     up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
-
-        #     intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-        #     down_proj = [
-        #         F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-        #     ]
-        #     down_proj = sum(down_proj)
-        # else:
-        #     down_proj = self.down_proj_masked(self.act_fn(self.gate_proj_masked(x)) * self.up_proj_masked(x))
-        x_masked = x[:, :, neuron_mask]  # Shape: (B, T, H')
-
         # Gate projection
-        gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (B, T, intermediate_size)
-        up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (B, T, intermediate_size)
+        masked_x = x[:, :, neuron_mask]  # Shape: (B, T, H')
+        gate_proj = F.linear(masked_x, self.gate_proj.weight[:, neuron_mask])  # Shape: (B, T, intermediate_size)
+        up_proj = F.linear(masked_x, self.up_proj.weight[:, neuron_mask])      # Shape: (B, T, intermediate_size)
 
         # Down projection
         down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight[neuron_mask, :])  # Shape: (B, T, H')
@@ -765,22 +745,16 @@ def norm_llama_decoder_layer_forward(
     #     hidden_states = self.mlp(hidden_states)
     #     # Compute neuron mask
     #     mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
-    #     # # Check if config has norm threshold, otherwise use default
-    #     # if hasattr(self.mlp.config, "norm_threshold"):
-    #     #     self.neuron_mask = mlp_norm > self.mlp.config.norm_threshold
-    #     # else:
-    #     # Pick the top-k neurons and filter the lower ones
-    #     # self.neuron_mask = mlp_norm > mlp_norm.median()
-    #     sparsity = 0.1  # keep 90% of the neurons
+    #     sparsity = 0.8  # keep (1 - sparsity) of the neurons
     #     self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
-    #     if self.self_attn.layer_idx == 0:
-    #         print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
-    #         print(f"last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
-    #         self.decode_step = 1
+    #     # if self.self_attn.layer_idx == 0:
+    #     #     # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+    #     #     # print(f"last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
+    #     #     self.decode_step = 1
     # else:  # decoding, we need to use the neuron mask which is obtained during prefilling
     #     hidden_states[:, :, self.neuron_mask] = self.mlp(hidden_states, self.neuron_mask)
-    #     if self.self_attn.layer_idx == 0:
-    #         self.decode_step += 1
+    #     # if self.self_attn.layer_idx == 0:
+    #     #     self.decode_step += 1
         
     hidden_states = residual + hidden_states
 

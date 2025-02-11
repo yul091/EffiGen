@@ -8,7 +8,7 @@ head_choice='reason' # copy, reason
 model_path=allenai/OLMoE-1B-7B-0924
 # Create longbench_logs directory if it does not exist
 mkdir -p longbench_logs
-device=0
+device=7
 attn_implementation=eager  # flash_attention_2
 
 export CUDA_VISIBLE_DEVICES=$device
