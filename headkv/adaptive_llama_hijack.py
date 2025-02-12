@@ -705,8 +705,8 @@ def norm_llama_mlp_forward(
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
     return down_proj
 
-@profile
-def norm_llama_decoder_layer_forward(
+
+def norm_llama_decoder_layer_nomlp_forward(
     self: LlamaDecoderLayer,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -740,21 +740,70 @@ def norm_llama_decoder_layer_forward(
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = self.mlp(hidden_states)
-    # if status == "prefilling":
-    #     hidden_states = self.mlp(hidden_states)
-    #     # Compute neuron mask
-    #     mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
-    #     sparsity = 0.8  # keep (1 - sparsity) of the neurons
-    #     self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
-    #     # if self.self_attn.layer_idx == 0:
-    #     #     # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
-    #     #     # print(f"last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
-    #     #     self.decode_step = 1
-    # else:  # decoding, we need to use the neuron mask which is obtained during prefilling
-    #     hidden_states[:, :, self.neuron_mask] = self.mlp(hidden_states, self.neuron_mask)
-    #     # if self.self_attn.layer_idx == 0:
-    #     #     self.decode_step += 1
+    # hidden_states = self.mlp(hidden_states)
+        
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    return outputs
+
+
+
+def norm_llama_decoder_layer_indexing_forward(
+    self: LlamaDecoderLayer,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    **kwargs,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    if "padding_mask" in kwargs:
+        warnings.warn(
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+        )
+
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Self Attention
+    hidden_states, self_attn_weights, present_key_value, status = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        **kwargs,
+    )
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    if status == "prefilling":
+        hidden_states = self.mlp(hidden_states)
+        # Compute neuron mask
+        mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
+        sparsity = 0.8  # keep (1 - sparsity) of the neurons
+        self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
+        # if self.self_attn.layer_idx == 0:
+        #     # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+        #     # print(f"last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
+        #     self.decode_step = 1
+    else:  # decoding, we need to use the neuron mask which is obtained during prefilling
+        hidden_states[:, :, self.neuron_mask] = self.mlp(hidden_states, self.neuron_mask)
+        # if self.self_attn.layer_idx == 0:
+        #     self.decode_step += 1
         
     hidden_states = residual + hidden_states
 
