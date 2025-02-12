@@ -17,7 +17,7 @@ import json
 # import pandas as pd
 import numpy as np
 # from pathlib import Path
-
+from utils import MODEL2PATH
 from reason_needle.prompts import DEFAULT_PROMPTS, DEFAULT_TEMPLATE, get_formatted_input
 from reason_needle.metrics import compare_answers, TASK_LABELS
 
@@ -90,7 +90,10 @@ def main(args):
     tokens = tokenizer.tokenize(all_prompt)
     context = cut_context(tokens, length=20_000, tokenizer=tokenizer)
     # print(f"Context: {context}")
-    inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to("cuda")
+    if args.device is not None:
+        inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to(args.device)
+    else:
+        inputs = tokenizer(context, return_tensors="pt", padding=True, truncation=True).to("cuda")
     batch_input_ids = inputs.input_ids
     attention_mask = inputs.attention_mask
     context_length = batch_input_ids.shape[-1]
@@ -184,24 +187,33 @@ if __name__ == "__main__":
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
-    
+    parser.add_argument("--device", type=int, default=None, help="device to use for evaluation.")
     args = parser.parse_args()
     
     set_seed(args.seed)
+
+    model_path = MODEL2PATH[args.model_path] if args.model_path in MODEL2PATH else args.model_path
     
     if args.model_path == 'mistralai/Mistral-7B-Instruct-v0.2':
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path,
+            model_path,
             use_fast=args.use_fast_tokenizer,
             padding_side="left",
             revision='dca6e4b60aca009ed25ffa70c9bb65e46960a573'
         )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path,
-            use_fast=args.use_fast_tokenizer,
-            padding_side="left"
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                use_fast=args.use_fast_tokenizer,
+                padding_side="left"
+            )
+        except:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                use_fast=False,
+                padding_side="left",
+            )
 
     if args.method.lower() != 'fullkv':
         from headkv.monkeypatch import (
@@ -215,14 +227,23 @@ if __name__ == "__main__":
         replace_mixtral(args.method)
         # replace_olmoe(args.method)
     
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        # device_map="auto",
-        use_cache=args.use_cache,
-        attn_implementation=args.attn_implementation
-    ).to("cuda")
+    if args.device is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            use_cache=args.use_cache,
+            attn_implementation=args.attn_implementation
+        ).to(args.device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            use_cache=args.use_cache,
+            attn_implementation=args.attn_implementation
+        )
     
     args.result_data = {}
 

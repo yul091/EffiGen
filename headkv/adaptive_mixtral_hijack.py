@@ -14,6 +14,9 @@ from transformers.models.mixtral.modeling_mixtral import (
     apply_rotary_pos_emb,
     repeat_kv,
     MixtralAttention,
+    MixtralBLockSparseTop2MLP,
+    MixtralSparseMoeBlock,
+    MixtralDecoderLayer,
 )
 from transformers.utils import (
     logging,
@@ -608,6 +611,9 @@ def norm_mixtral_flash_attn2_forward(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     # Because the input can be padded, the absolute sequence length depends on the max position id.
+    # print(f"position_ids.shape: {position_ids.shape}")
+    # print(f"kv_seq_len: {kv_seq_len}")
+    # print(f"position_ids[:, -1]: {position_ids[:, -1]}")
     rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
     cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
@@ -628,7 +634,7 @@ def norm_mixtral_flash_attn2_forward(
     # [SnapKV] move to ahead
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+    self.generation_phase = "prefilling"
     if past_key_value is not None:
         # Activate slicing cache only if the config has a value `sliding_windows` attribute
         cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
@@ -730,6 +736,7 @@ def norm_mixtral_flash_attn2_forward(
                                                  cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True).reshape(
                 bsz, self.num_heads, q_len, self.head_dim)
             attn_output = attn_output.transpose(0, 1).reshape(bsz, q_len, self.hidden_size)
+            self.generation_phase = "decoding"
 
     attn_output = self.o_proj(attn_output)
 
@@ -737,6 +744,185 @@ def norm_mixtral_flash_attn2_forward(
         attn_weights = None
 
     return attn_output, attn_weights, past_key_value
+
+
+def norm_mixtral_mlp_forward(
+    self: MixtralBLockSparseTop2MLP, 
+    hidden_states: torch.Tensor,
+    neuron_mask: Optional[torch.BoolTensor] = None,
+):
+    if neuron_mask is not None:
+        masked_hidden_states = hidden_states[:, neuron_mask]  # shape: (X * B, H')
+        w1_project = F.linear(masked_hidden_states, self.w1.weight[:, neuron_mask])  # shape: (X * B, ffn_dim)
+        w3_project = F.linear(masked_hidden_states, self.w3.weight[:, neuron_mask])  # shape: (X * B, ffn_dim)
+        current_hidden_states = self.w2(self.act_fn(w1_project) * w3_project)  # shape: (X * B, H)
+    else:
+        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
+        current_hidden_states = self.w2(current_hidden_states)
+    return current_hidden_states
+        
+
+
+def norm_mixtral_sparse_block_forward(
+    self: MixtralSparseMoeBlock,
+    hidden_states: torch.Tensor,
+    neuron_mask: Optional[torch.BoolTensor] = None,
+):
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    if self.training and self.jitter_noise > 0:
+        hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+    hidden_states = hidden_states.view(-1, hidden_dim)
+    # router_logits: (batch * sequence_length, n_experts)
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    # we cast back to the input dtype
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    final_hidden_states = torch.zeros(
+        (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+
+    # One hot encode the selected experts to create an expert mask
+    # this will be used to easily index which expert is going to be sollicitated
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+    # Loop over all available experts in the model and perform the computation on each expert
+    for expert_idx in range(self.num_experts):
+        expert_layer = self.experts[expert_idx]
+        idx, top_x = torch.where(expert_mask[expert_idx])
+
+        # Index the correct hidden states and compute the expert hidden state for
+        # the current expert. We need to make sure to multiply the output hidden
+        # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+        current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+        current_hidden_states = expert_layer(current_state, neuron_mask) * routing_weights[top_x, idx, None]
+
+        # However `index_add_` only support torch tensors for indexing so we'll use
+        # the `top_x` tensor here.
+        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    return final_hidden_states, router_logits
+
+
+
+def norm_mixtral_decoder_layer_nomlp_forward(
+    self: MixtralDecoderLayer,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    output_router_logits: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    **kwargs,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    if "padding_mask" in kwargs:
+        warnings.warn(
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+        )
+
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Self Attention
+    hidden_states, self_attn_weights, present_key_value, phase = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+    )
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    return outputs
+
+
+def norm_mixtral_decoder_layer_indexing_forward(
+    self: MixtralDecoderLayer,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    output_router_logits: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    **kwargs,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    if "padding_mask" in kwargs:
+        warnings.warn(
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+        )
+
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Self Attention
+    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+    )
+    phase = self.self_attn.generation_phase
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    # hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+    if phase == "prefilling":
+        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
+        sparsity = 0.8
+        self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
+        # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+        # for expert in self.mlp.experts:
+        #     if not hasattr(expert, 'gate_proj_masked'):
+        #         create_indexed_weights(expert, self.neuron_mask)
+        # if self.self_attn.layer_idx == 0:
+            # print(f"[prefilling] last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
+            # self.decode_step = 1
+    else:  # decoding, we need to use the neuron mask which is obtained during prefilling
+        # TO-DO: this part is really time-consuming  (64%)
+        hidden_states, router_logits = self.block_sparse_moe(hidden_states, self.neuron_mask)  
+        # if self.self_attn.layer_idx == 0:
+        #     self.decode_step += 1
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    if output_router_logits:
+        outputs += (router_logits,)
+
+    return outputs
+
 
 
 

@@ -202,21 +202,15 @@ def norm_olmoe_mlp_forward(
     neuron_mask: Optional[torch.BoolTensor] = None,
 ):
     if neuron_mask is not None:
-        if x.numel() == 0:
-            return x
         x_masked = x[:, neuron_mask]  # Shape: (X * B, H')
 
-        # # Gate projection
-        # gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (X * B, intermediate_size)
-        # up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (X * B, intermediate_size)
+        # Gate projection
+        gate_proj = F.linear(x_masked, self.gate_proj.weight[:, neuron_mask])  # Shape: (X * B, intermediate_size)
+        up_proj = F.linear(x_masked, self.up_proj.weight[:, neuron_mask])      # Shape: (X * B, intermediate_size)
 
-        # # Down projection
-        # down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight)  # Shape: (X * B, H)
-        try:
-            down_proj = self.down_proj_masked(self.act_fn(self.gate_proj_masked(x_masked)) * self.up_proj_masked(x_masked))
-        except:
-            print(f"x {x.shape}, x_masked {x_masked.shape}, neuron_mask {neuron_mask.sum().item()}, gate_proj_masked {self.gate_proj_masked.weight.shape}, up_proj_masked {self.up_proj_masked.weight.shape}, down_proj_masked {self.down_proj_masked.weight.shape}")
-
+        # Down projection
+        down_proj = F.linear(self.act_fn(gate_proj) * up_proj, self.down_proj.weight)  # Shape: (X * B, H)
+        
     else:
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
     
@@ -266,28 +260,28 @@ def norm_olmoe_mlp_forward(
     
 #         return down_proj
 
-def create_indexed_weights(
-    self: OlmoeMLP, 
-    neuron_mask: torch.BoolTensor,
-):
-    """
-    Create indexed weights based on neuron_mask and move them to GPU.
-    This avoids repeated indexing overhead during inference.
-    """
-    h_prime = neuron_mask.sum().item()  # The reduced input dimension H'
-    self.original_device = self.gate_proj.weight.device
-    dtype = self.gate_proj.weight.dtype
+# def create_indexed_weights(
+#     self: OlmoeMLP, 
+#     neuron_mask: torch.BoolTensor,
+# ):
+#     """
+#     Create indexed weights based on neuron_mask and move them to GPU.
+#     This avoids repeated indexing overhead during inference.
+#     """
+#     h_prime = neuron_mask.sum().item()  # The reduced input dimension H'
+#     self.original_device = self.gate_proj.weight.device
+#     dtype = self.gate_proj.weight.dtype
 
-    # Create new Linear layers with modified input size
-    self.gate_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
-    self.up_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
-    self.down_proj_masked = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=dtype).to(self.original_device)
+#     # Create new Linear layers with modified input size
+#     self.gate_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
+#     self.up_proj_masked = nn.Linear(h_prime, self.intermediate_size, bias=False, dtype=dtype).to(self.original_device)
+#     self.down_proj_masked = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=dtype).to(self.original_device)
 
-    with torch.no_grad():
-        # Assign the masked weights
-        self.gate_proj_masked.weight.copy_(self.gate_proj.weight[:, neuron_mask])
-        self.up_proj_masked.weight.copy_(self.up_proj.weight[:, neuron_mask])
-        self.down_proj_masked.weight.copy_(self.down_proj.weight)
+#     with torch.no_grad():
+#         # Assign the masked weights
+#         self.gate_proj_masked.weight.copy_(self.gate_proj.weight[:, neuron_mask])
+#         self.up_proj_masked.weight.copy_(self.up_proj.weight[:, neuron_mask])
+#         self.down_proj_masked.weight.copy_(self.down_proj.weight)
 
     # # Offload the original weights to CPU
     # self.gate_proj.to("cpu")
@@ -362,7 +356,7 @@ def norm_olmoe_sparse_block_forward(
 
 
 @profile
-def norm_olmoe_decoder_layer_forward(
+def norm_olmoe_decoder_layer_indexing_forward(
     self: OlmoeDecoderLayer,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -397,26 +391,25 @@ def norm_olmoe_decoder_layer_forward(
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    # hidden_states, router_logits = self.mlp(hidden_states)  # 32%
     if phase == "prefilling":
         hidden_states, router_logits = self.mlp(hidden_states, )
         mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
-        sparsity = 0.5
+        sparsity = 0.8
         self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
-        print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
-        for expert in self.mlp.experts:
-            if not hasattr(expert, 'gate_proj_masked'):
-                create_indexed_weights(expert, self.neuron_mask)
+        # print(f"sparsity: {1 - self.neuron_mask.sum().item() / self.neuron_mask.numel()}")
+        # for expert in self.mlp.experts:
+        #     if not hasattr(expert, 'gate_proj_masked'):
+        #         create_indexed_weights(expert, self.neuron_mask)
 
-        if self.self_attn.layer_idx == 0:
-            print(f"[prefilling] last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
-            self.decode_step = 1
+        # if self.self_attn.layer_idx == 0:
+            # print(f"[prefilling] last decode step: {self.decode_step if hasattr(self, 'decode_step') else None}")
+            # self.decode_step = 1
 
     else:  # decoding, we need to use the neuron mask which is obtained during prefilling
         # TO-DO: this part is really time-consuming  (64%)
         hidden_states, router_logits = self.mlp(hidden_states, self.neuron_mask)  
-        if self.self_attn.layer_idx == 0:
-            self.decode_step += 1
+        # if self.self_attn.layer_idx == 0:
+        #     self.decode_step += 1
         
     hidden_states = residual + hidden_states
 

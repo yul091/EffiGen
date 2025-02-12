@@ -1,4 +1,6 @@
 import os
+import sys
+sys.dont_write_bytecode = True
 import json
 import random
 import argparse
@@ -8,7 +10,7 @@ from tqdm import tqdm
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from utils import MODEL2PATH
 
 datasets = [
     'narrativeqa',
@@ -133,7 +135,6 @@ def main(args):
     input_max_len = 0
     
     model_path = args.model_path.lower()
-
     
     for key in model2maxlen:
         if key in model_path:
@@ -319,20 +320,29 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     set_seed(args.seed)
+
+    model_path = MODEL2PATH[args.model_path] if args.model_path in MODEL2PATH else args.model_path
     
     if args.model_path == 'mistralai/Mistral-7B-Instruct-v0.2':
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path,
+            model_path,
             use_fast=args.use_fast_tokenizer,
             padding_side="left",
             revision='dca6e4b60aca009ed25ffa70c9bb65e46960a573'
         )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path,
-            use_fast=args.use_fast_tokenizer,
-            padding_side="left"
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                use_fast=args.use_fast_tokenizer,
+                padding_side="left",
+            )
+        except:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                use_fast=False,
+                padding_side="left"
+            )
 
     if args.method.lower() != 'fullkv':
         from headkv.monkeypatch import (
@@ -347,7 +357,7 @@ if __name__ == "__main__":
         # replace_olmoe(args.method)
     
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
@@ -360,20 +370,11 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-
         
     model.eval()
-    
     save_dir = args.save_dir
-    
-        
     max_capacity_prompts = args.max_capacity_prompts
-    
 
-
-
-        
 
     for idx, dataset in enumerate(datasets):
         

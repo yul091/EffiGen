@@ -2,6 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+MODEL2PATH = {
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "/home/yuli/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/41bd4c9e7e4fb318ca40e721131d4933966c2cc1",
+
+}
+
+
 def plot_attention(avg_attn_weight, ax, fig, max_length=None, tick_interval=None):
     max_length = max_length or avg_attn_weight.shape[0]
     tick_interval = tick_interval or max_length // 8
