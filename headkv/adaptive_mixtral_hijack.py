@@ -7,8 +7,10 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union, Any,Dict
 import warnings
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa, \
-    _prepare_4d_causal_attention_mask
+from transformers.modeling_attn_mask_utils import (
+    _prepare_4d_causal_attention_mask_for_sdpa,
+    _prepare_4d_causal_attention_mask,
+)
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.mixtral.modeling_mixtral import (
     apply_rotary_pos_emb,

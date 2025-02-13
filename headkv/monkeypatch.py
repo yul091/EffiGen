@@ -5,7 +5,7 @@ import warnings
 import transformers
 from headkv.fixed_mistral_hijack import pyramidkv_mistral_flash_attn2_forward, fixed_mistral_flash_attn2_forward, fixed_MistralModel_forward
 from headkv.fixed_mistral_hijack import prepare_inputs_for_generation_mistral as fixed_prepare_inputs_for_generation_mistral
-from headkv.adaptive_mistral_hijack import reason_mistral_flash_attn2_forward, adaptive_mistral_flash_attn2_forward, adaptive_MistralModel_forward, norm_mistral_flash_attn2_forward, norm_mistral_decoder_layer_indexing_forward, norm_mistral_decoder_layer_nomlp_forward
+from headkv.adaptive_mistral_hijack import reason_mistral_flash_attn2_forward, adaptive_mistral_flash_attn2_forward, adaptive_MistralModel_forward, norm_mistral_flash_attn2_forward, norm_mistral_mlp_forward, norm_mistral_decoder_layer_indexing_forward, norm_mistral_decoder_layer_nomlp_forward
 from headkv.adaptive_mistral_hijack import prepare_inputs_for_generation_mistral as ada_prepare_inputs_for_generation_mistral
 from headkv.adaptive_mixtral_hijack import reason_mixtral_flash_attn2_forward, adaptive_mixtral_flash_attn2_forward, adaptive_MixtralModel_forward, norm_mixtral_flash_attn2_forward, norm_mixtral_mlp_forward, norm_mixtral_sparse_block_forward, norm_mixtral_decoder_layer_indexing_forward, norm_mixtral_decoder_layer_nomlp_forward
 from headkv.adaptive_mixtral_hijack import prepare_inputs_for_generation_mixtral as ada_prepare_inputs_for_generation_mixtral
@@ -107,7 +107,13 @@ def replace_mistral(method):
         transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_mistral
         transformers.models.mistral.modeling_mistral.MistralModel.forward = adaptive_MistralModel_forward
         transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = norm_mistral_flash_attn2_forward
-        transformers.models.mistral.modeling_mistral.MistralDecoderLayer.forward = norm_mistral_decoder_layer_forward
+        transformers.models.mistral.modeling_mistral.MistralDecoderLayer.forward = norm_mistral_decoder_layer_nomlp_forward
+    elif method == 'NormKV_indexmlp':
+        transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_mistral
+        transformers.models.mistral.modeling_mistral.MistralModel.forward = adaptive_MistralModel_forward
+        transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = norm_mistral_flash_attn2_forward
+        transformers.models.mistral.modeling_mistral.MistralMLP.forward = norm_mistral_mlp_forward  # MLP sparsity
+        transformers.models.mistral.modeling_mistral.MistralDecoderLayer.forward = norm_mistral_decoder_layer_indexing_forward
 
 
 def replace_llama(method):
