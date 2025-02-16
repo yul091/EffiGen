@@ -554,6 +554,7 @@ def mixtral_model_causallm_forward_with_outputs(
 
 
 def patch_mixtral_model_forward_with_outputs():
+    import transformers
     transformers.models.mixtral.modeling_mixtral.MixtralModel.forward = mixtral_model_forward_with_outputs
     transformers.models.mixtral.modeling_mixtral.MixtralForCausalLM.forward = mixtral_model_causallm_forward_with_outputs
     transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward = mixtral_sparse_moe_forward_with_outputs

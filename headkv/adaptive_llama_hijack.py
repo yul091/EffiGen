@@ -937,6 +937,3 @@ if __name__ == "__main__":
             y = mlp(hidden_states, neuron_mask)
         # torch.cuda.synchronize()
         print("Time (neuron_mask): ", time.perf_counter() - t)
-
-
-

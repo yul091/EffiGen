@@ -100,8 +100,6 @@ if __name__ == '__main__':
             try:
                 args.dataset = dataset
                 args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
-                
-                
                 scores = dict()
                 predictions, answers, lengths, output_lengths = [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:
@@ -109,13 +107,15 @@ if __name__ == '__main__':
                         try:
                             data = json.loads(line)
                             predictions.append(data["pred"])
-                            output_lengths.append(data["output_length"])
+                            if "output_length" in data:
+                                output_lengths.append(data["output_length"])
                             answers.append(data["answers"])
                             all_classes = data["all_classes"]
                             if "length" in data:
                                 lengths.append(data["length"])
-                        except:
-                            print("error")
+                        except Exception as e:
+                            print(e)
+                            # print("error")
                 if args.longbench_e:
                     score = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
                 else:
@@ -123,7 +123,8 @@ if __name__ == '__main__':
                     if args.dataset == 'qasper':
                         score_e = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
                 scores[args.dataset] = score
-                scores[f"{args.dataset}_output_length"] = np.mean(output_lengths)
+                if output_lengths:
+                    scores[f"{args.dataset}_output_length"] = np.mean(output_lengths)
                     
                 output_dir = os.path.dirname(args.eval_file)
                 

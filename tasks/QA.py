@@ -23,7 +23,7 @@ def compute_QA_accuracy(model, dataset, tokenizer):
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
         input_ids = inputs["input_ids"]
         # Generate response
-        outputs = model.generate(**inputs, max_new_tokens=5, eos_token_id=tokenizer.eos_token_id)
+        outputs = model.generate(**inputs, max_new_tokens=5, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)
         # decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
         decoded_output = tokenizer.batch_decode(outputs[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
         # print(decoded_output)

@@ -12,8 +12,8 @@ max_output_length=1
 
 for max_capacity_prompts in 128; do
     # for model_path in mistralai/Mixtral-8x7B-Instruct-v0.1; do
-    for method in PyramidKV; do
-    # for method in fullkv; do
+    # for method in PyramidKV; do
+    for method in fullkv; do
         save_dir="./results_profile/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
         python run_latency.py \
             --method ${method} \
@@ -24,6 +24,8 @@ for max_capacity_prompts in 128; do
             --temp ${temp} \
             --attn_implementation ${attn_implementation} \
             --save_dir ${save_dir} \
+            --prune_mlp \
+            --sparsity 0.5 \
             --use_cache True
 
         # python run_memory.py \

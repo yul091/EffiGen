@@ -23,6 +23,8 @@ from reason_needle.metrics import compare_answers, TASK_LABELS
 
 from datasets import load_from_disk, load_dataset
 from reason_needle.reason_utils import TaskDataset, SentenceSampler, NoiseInjectionDataset
+from models import patch_mixtral_model_forward_with_outputs
+from studies import get_dataset, prune_model
 
 import random
 import argparse
@@ -77,9 +79,11 @@ def main(args):
     model_path = args.model_path.lower()
     max_output_lengths = [10, 50, 100, 500, 1_000, 2_000, 3_000, 4_000, 5_000,]
     model_name = model_path.split("/")[-1]
-    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
-    memory_fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_latency.json"), "w")
+    base_dir = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}") if not args.prune_mlp else \
+          os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}_prune_mlp_{args.sparsity}")
+    os.makedirs(os.path.join(base_dir, args.dataset), exist_ok=True)
+    fout = open(os.path.join(base_dir, args.dataset, f"{args.method}.json"), "w")
+    memory_fout = open(os.path.join(base_dir, args.dataset, f"{args.method}_latency.json"), "w")
 
     data_dir = 'reason_needle/babilong-100examples/64k/qa1/'
     file = os.path.join(data_dir, 'data-00000-of-00001.arrow')
@@ -182,15 +186,20 @@ if __name__ == "__main__":
     parser.add_argument("--top_num", type=int, default=10)
     parser.add_argument('--beta', type=float, default=1.5)
     parser.add_argument('--temp', type=float, default=1.0)
-    parser.add_argument('--alpha', type=float, default=1, help='should be [0, 1]. 1-- total copy.')
+    parser.add_argument('--alpha', type=float, default=1, help='should be [0, 1]. 1 -- total copy.')
     parser.add_argument('--pyram_beta', type=float, default=20)
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--device", type=int, default=None, help="device to use for evaluation.")
+    parser.add_argument("--prune_mlp", action="store_true", help="prune mlp neurons.")
+    parser.add_argument("--sparsity", type=float, default=0.2, help="sparsity for pruning.")
     args = parser.parse_args()
     
     set_seed(args.seed)
+
+    if args.prune_mlp:
+        patch_mixtral_model_forward_with_outputs()
 
     model_path = MODEL2PATH[args.model_path] if args.model_path in MODEL2PATH else args.model_path
     
@@ -265,6 +274,12 @@ if __name__ == "__main__":
     save_dir = args.save_dir
 
     max_capacity_prompts = args.max_capacity_prompts
+
+    if args.prune_mlp:
+        max_length = model.config.max_position_embeddings
+        dataloader, dataset = get_dataset('language_modeling', tokenizer, batch_size=5, max_length=max_length, num_samples=100)
+        prune_model(model, dataloader, sparsity=args.sparsity, pruning_target="mlp", device="cuda")
+
     
     for idx, dataset in enumerate(datasets):
         
