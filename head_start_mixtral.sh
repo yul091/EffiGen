@@ -2,7 +2,7 @@
 
 # max_capacity_prompts=128
 export CUDA_LAUNCH_BLOCKING=1
-method=NormKV  # AdativeKV, ReasonKV, NormKV, fullkv
+method=NormKV  # AdativeKV, ReasonKV, NormKV, fullkv, SnapKV, PyramidKV
 # devices=(0 1 2 3 4 5 6 7 8)
 head_choice='reason' #  copy, reason
 # betas=(1.005 1.01 1.1 1.2 1.5 2 5 10)
@@ -17,7 +17,7 @@ attn_implementation=flash_attention_2  # eager, flash_attention_2
 
 # export CUDA_VISIBLE_DEVICES=$device
 for max_capacity_prompts in 128 256 512 1024; do
-    for method in AdativeKV NormKV; do
+    for method in SnapKV PyramidKV; do
         save_dir="./results/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
         python3 run_longbench.py \
             --method ${method} \
