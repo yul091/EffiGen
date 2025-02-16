@@ -1,1 +1,2 @@
 from .llama_output import LlamaForCausalLM
+from .mixtral_output import MixtralForCausalLM, patch_mixtral_model_forward_with_outputs, modify_indexed_weights

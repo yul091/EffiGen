@@ -894,7 +894,7 @@ def norm_mixtral_decoder_layer_indexing_forward(
     hidden_states = self.post_attention_layernorm(hidden_states)
     # hidden_states, router_logits = self.block_sparse_moe(hidden_states)
     if phase == "prefilling":
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits = self.block_sparse_moe(hidden_states)  # shape: (batch_size, sequence_length, hidden_size)
         mlp_norm = torch.norm(hidden_states, p=2, dim=1).mean(dim=0)  # L2 norm -> Shape: (hidden_size)
         sparsity = 0.8
         self.neuron_mask = mlp_norm > mlp_norm.topk(int(sparsity * mlp_norm.shape[0]), largest=False).values[-1]
