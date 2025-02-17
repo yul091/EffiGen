@@ -1,4 +1,5 @@
 
+import gc
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union, Dict
@@ -6,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
+import torch.backends.cudnn as cudnn
 
 import transformers
 from transformers.utils import logging, ModelOutput
@@ -136,10 +138,17 @@ def modify_indexed_weights(
 
     with torch.no_grad():
         # Assign the masked weights
-        w1_masked.weight.copy_(self.w1.weight[:, self.neuron_mask])
-        w3_masked.weight.copy_(self.w3.weight[:, self.neuron_mask])
-        self.w1 = w1_masked
-        self.w3 = w3_masked
+        w1_masked.weight.copy_(self.w1.weight[:, self.neuron_mask].clone().contiguous())
+        w3_masked.weight.copy_(self.w3.weight[:, self.neuron_mask].clone().contiguous())
+
+    # Free old weights
+    del self.w1
+    del self.w3
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    self.w1 = w1_masked
+    self.w3 = w3_masked
 
 
 def norm_mixtral_mlp_forward(
@@ -148,7 +157,8 @@ def norm_mixtral_mlp_forward(
     neuron_mask: Optional[torch.BoolTensor] = None,
 ):
     if neuron_mask is not None:
-        masked_hidden_states = hidden_states[:, neuron_mask]  # shape: (X * B, H')
+        cudnn.benchmark = True  # ✅ Enable faster CUDA kernel selection
+        masked_hidden_states = hidden_states[:, neuron_mask].contiguous()  # shape: (X * B, H')
         current_hidden_states = self.act_fn(self.w1(masked_hidden_states)) * self.w3(masked_hidden_states)
         current_hidden_states = self.w2(current_hidden_states)
     else:
