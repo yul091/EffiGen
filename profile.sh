@@ -1,18 +1,20 @@
 export CUDA_LAUNCH_BLOCKING=1
 # method=NormKV # AdativeKV, ReasonKV, NormKV, NormKV_indexmlp, fullkv, SnapKV, PyramidKV
-# max_capacity_prompts=128 # 128,2048 in paper
+max_capacity_prompts=128 # 128,2048 in paper
 attn_implementation=flash_attention_2 # Support "flash_attention_2", "eager"
 model_path=mistralai/Mixtral-8x7B-Instruct-v0.1 # meta-llama/Meta-Llama-3-8B-Instruct, allenai/OLMoE-1B-7B-0924, mistralai/Mistral-7B-Instruct-v0.2, mistralai/Mixtral-8x7B-Instruct-v0.1
 head_choice=('reason')
 beta=1.005
 temp=1
 max_output_length=1
-# device=5
+# device=3
 # --device ${device} \
+# --prune_mlp \
+# --sparsity 0.5 \
 
-for max_capacity_prompts in 128; do
-    # for model_path in mistralai/Mixtral-8x7B-Instruct-v0.1; do
-    # for method in PyramidKV; do
+# for max_capacity_prompts in 128; do
+for model_path in mistralai/Mixtral-8x7B-Instruct-v0.1; do
+    # for method in SnapKV PyramidKV; do
     for method in fullkv; do
         save_dir="./results_profile/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
         python run_latency.py \
