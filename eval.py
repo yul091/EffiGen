@@ -38,6 +38,8 @@ def parse_args(args=None):
     parser.add_argument('--capacity', type=int, default=128)
     parser.add_argument('--method', type=str, default='ReasonKV')
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument("--prune_mlp", action="store_true", help="prune mlp neurons.")
+    parser.add_argument("--sparsity", type=float, default=None, help="sparsity for pruning.")
     return parser.parse_args(args)
 
 def scorer_e(dataset, predictions, answers, lengths, all_classes):
@@ -71,7 +73,8 @@ def scorer(dataset, predictions, answers, all_classes):
 
 if __name__ == '__main__':
     args = parse_args()
-    args.results_dir = f"{args.results_dir}/{args.model}_{args.capacity}"
+    args.results_dir = f"{args.results_dir}/{args.model}_{args.capacity}" if args.sparsity is None else \
+        f"{args.results_dir}/{args.model}_{args.capacity}_prune_mlp_{args.sparsity}"
     dataset_list = [
         "narrativeqa",
         "qasper",
@@ -80,10 +83,10 @@ if __name__ == '__main__':
         "2wikimqa",
         "musique",
 
-        'comprehension_and_reasoning',
-        'computation',
-        'multiple_information_retrieval',
-        'timeline_reorder'
+        # 'comprehension_and_reasoning',
+        # 'computation',
+        # 'multiple_information_retrieval',
+        # 'timeline_reorder'
         ]
     
     results_list = [
@@ -99,7 +102,7 @@ if __name__ == '__main__':
         for idx, method in enumerate([args.method]):
             try:
                 args.dataset = dataset
-                args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
+                args.eval_file = os.path.join(args.results_dir, dataset, f"{method}.json")
                 scores = dict()
                 predictions, answers, lengths, output_lengths = [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:

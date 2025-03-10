@@ -17,7 +17,6 @@ import json
 # import pandas as pd
 import numpy as np
 # from pathlib import Path
-
 from reason_needle.prompts import DEFAULT_PROMPTS, DEFAULT_TEMPLATE, get_formatted_input
 from reason_needle.metrics import compare_answers, TASK_LABELS
 
@@ -244,7 +243,6 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation
     )
     
-
     args.result_data = {}
 
     tokenizer.padding_side = "left"

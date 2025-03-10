@@ -9,8 +9,11 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils import MODEL2PATH
+from models import patch_mixtral_model_forward_with_outputs
+from studies import get_dataset, prune_model
+
 
 datasets = [
     'narrativeqa',
@@ -19,10 +22,10 @@ datasets = [
     'hotpotqa',
     '2wikimqa',
     'musique',
-    'comprehension_and_reasoning',
-    'computation',
-    'multiple_information_retrieval',
-    'timeline_reorder'
+    # 'comprehension_and_reasoning',
+    # 'computation',
+    # 'multiple_information_retrieval',
+    # 'timeline_reorder'
 ]
 
 
@@ -186,10 +189,10 @@ def main(args):
     print("Finish loading model and tokenizer")
     
     model_name = model_path.split("/")[-1]
-
-    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
-
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
+    base_dir = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}") if args.sparsity is None \
+        else os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}_prune_mlp_{args.sparsity}")
+    os.makedirs(os.path.join(base_dir, args.dataset), exist_ok=True)
+    fout = open(os.path.join(base_dir, args.dataset, f"{args.method}.json"), "w")
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         
@@ -266,7 +269,6 @@ def main(args):
             example["all_classes"] = batch_all_classess[j]
             example["_id"] = batch__ids[j]
 
-
             fout.write(json.dumps(example) + "\n")
     
     
@@ -304,6 +306,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
+    parser.add_argument("--prune_mlp", action="store_true", help="prune mlp neurons.")
+    parser.add_argument("--sparsity", type=float, default=None, help="sparsity for pruning.")
     
     parser.add_argument(
         "--use_chat_format", 
@@ -318,6 +322,9 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+
+    if args.prune_mlp:
+        patch_mixtral_model_forward_with_outputs()
     
     set_seed(args.seed)
 
@@ -362,8 +369,10 @@ if __name__ == "__main__":
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=args.use_cache,
-        attn_implementation=args.attn_implementation
+        attn_implementation=args.attn_implementation,
     )
+    if "indexmlp" in args.method:
+        model.config.mlp_sparsity = args.sparsity
     
 
     tokenizer.padding_side = "left"
@@ -374,6 +383,11 @@ if __name__ == "__main__":
     model.eval()
     save_dir = args.save_dir
     max_capacity_prompts = args.max_capacity_prompts
+
+    if args.prune_mlp:
+        max_length = model.config.max_position_embeddings
+        dataloader, _ = get_dataset('language_modeling', tokenizer, batch_size=5, max_length=max_length, num_samples=100)
+        prune_model(model, dataloader, sparsity=args.sparsity, pruning_target="mlp", device="cuda")
 
 
     for idx, dataset in enumerate(datasets):

@@ -7,8 +7,9 @@ from headkv.fixed_mistral_hijack import pyramidkv_mistral_flash_attn2_forward, f
 from headkv.fixed_mistral_hijack import prepare_inputs_for_generation_mistral as fixed_prepare_inputs_for_generation_mistral
 from headkv.adaptive_mistral_hijack import reason_mistral_flash_attn2_forward, adaptive_mistral_flash_attn2_forward, adaptive_MistralModel_forward, norm_mistral_flash_attn2_forward, norm_mistral_mlp_forward, norm_mistral_decoder_layer_indexing_forward, norm_mistral_decoder_layer_nomlp_forward
 from headkv.adaptive_mistral_hijack import prepare_inputs_for_generation_mistral as ada_prepare_inputs_for_generation_mistral
-from headkv.adaptive_mixtral_hijack import reason_mixtral_flash_attn2_forward, adaptive_mixtral_flash_attn2_forward, adaptive_MixtralModel_forward, norm_mixtral_flash_attn2_forward, norm_mixtral_mlp_forward, norm_mixtral_sparse_block_forward, norm_mixtral_decoder_layer_indexing_forward, norm_mixtral_decoder_layer_nomlp_forward
+from headkv.adaptive_mixtral_hijack import reason_mixtral_flash_attn2_forward, adaptive_mixtral_flash_attn2_forward, adaptive_MixtralModel_forward, norm_mixtral_flash_attn2_forward
 from headkv.adaptive_mixtral_hijack import prepare_inputs_for_generation_mixtral as ada_prepare_inputs_for_generation_mixtral
+from headkv.mlp_mixtral_hijack import sparsity_init, mixtral_mlp_masked_forward, mixtral_sparse_block_forward, mixtral_decoder_layer_masked_forward
 
 from headkv.fixed_llama_hijack import pyramidkv_llama_flash_attn2_forward, fixed_llama_flash_attn2_forward, fixed_LlamaModel_forward
 from headkv.fixed_llama_hijack import prepare_inputs_for_generation_llama as fixed_prepare_inputs_for_generation_llama
@@ -180,6 +181,7 @@ def replace_mixtral(method):
         transformers.models.mixtral.modeling_mixtral.MixtralForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_mixtral
         transformers.models.mixtral.modeling_mixtral.MixtralModel.forward = adaptive_MixtralModel_forward
         transformers.models.mixtral.modeling_mixtral.MixtralFlashAttention2.forward = norm_mixtral_flash_attn2_forward
-        transformers.models.mixtral.modeling_mixtral.MixtralBLockSparseTop2MLP.forward = norm_mixtral_mlp_forward  # MLP sparsity
-        transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward = norm_mixtral_sparse_block_forward  # Sparse block
-        transformers.models.mixtral.modeling_mixtral.MixtralDecoderLayer.forward = norm_mixtral_decoder_layer_indexing_forward
+        transformers.models.mixtral.modeling_mixtral.MixtralBLockSparseTop2MLP.__init__ = sparsity_init  # MLP sparsity
+        transformers.models.mixtral.modeling_mixtral.MixtralBLockSparseTop2MLP.forward = mixtral_mlp_masked_forward  # MLP sparsity
+        transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward = mixtral_sparse_block_forward  # Sparse block
+        transformers.models.mixtral.modeling_mixtral.MixtralDecoderLayer.forward = mixtral_decoder_layer_masked_forward

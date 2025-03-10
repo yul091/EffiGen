@@ -38,6 +38,8 @@ def get_dataset(task, tokenizer, batch_size=1, max_length=None, num_samples=100)
         if num_samples > 0:
             wiki_samples = min(num_samples, len(wiki))
             wiki = wiki.filter(lambda x: x["text"].strip()).select(range(wiki_samples))
+        else:
+            wiki = wiki.filter(lambda x: x["text"].strip())
         dataset = wiki
 
         def tokenize_function(example):
@@ -50,6 +52,8 @@ def get_dataset(task, tokenizer, batch_size=1, max_length=None, num_samples=100)
         if num_samples > 0:
             openbookqa_samples = min(num_samples, len(openbookqa))
             openbookqa = openbookqa.filter(lambda x: x["question_stem"].strip()).select(range(openbookqa_samples))
+        else:
+            openbookqa = openbookqa.filter(lambda x: x["question_stem"].strip())
         dataset = openbookqa
 
         def tokenize_function(example):
@@ -85,7 +89,8 @@ def get_dataset(task, tokenizer, batch_size=1, max_length=None, num_samples=100)
 
 # Load LLaMA model and tokenizer
 def prune_model(model: MixtralForCausalLM, dataloader: DataLoader, sparsity: float=0.1, pruning_target: str = "mlp", device: str = "cuda"):
-
+    ori_params = model.num_parameters()
+    print(f"Before pruning: model has {ori_params} parameters")
     layerwise_expert_output_norms = {}
     for step, batch in enumerate(tqdm.tqdm(dataloader, total=len(dataloader), desc="Computing expert norms")):
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -109,7 +114,47 @@ def prune_model(model: MixtralForCausalLM, dataloader: DataLoader, sparsity: flo
             # Prune mlp neurons
             modify_indexed_weights(model.model.layers[layer].block_sparse_moe.experts[expert_id], neuron_mask)
 
-    
+    current_params = model.num_parameters()
+    print(f"After pruning: model has {current_params} ({current_params / ori_params * 100:.2f}%) parameters")
+
+
+# def save_pruned_model(model: MixtralForCausalLM, save_dir: str = "pruned_mixtral"):
+#     """
+#     Saves the pruned Mixtral model in a Hugging Face-compatible format.
+#     """
+#     os.makedirs(save_dir, exist_ok=True)
+
+#     # ✅ Save model weights
+#     model.save_pretrained(save_dir)
+
+#     print(f"Pruned model saved at: {save_dir}")
+
+def save_pruned_model(model: MixtralForCausalLM, save_dir: str = "pruned_mixtral"):
+    """
+    Saves the pruned Mixtral model in a Hugging Face-compatible format with updated architecture.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # ✅ Update config to match pruned architecture
+    config = model.config
+    for layer in model.model.layers:
+        for expert in layer.block_sparse_moe.experts:
+            if hasattr(expert, "neuron_mask"):
+                new_hidden_dim = expert.neuron_mask.sum().item()
+                expert.config.hidden_size = new_hidden_dim  # Update config
+
+    config.save_pretrained(save_dir)  # ✅ Save updated config
+
+    # ✅ Save model weights
+    model.save_pretrained(save_dir)
+
+    # ✅ Save tokenizer if applicable
+    if hasattr(model, "tokenizer"):
+        model.tokenizer.save_pretrained(save_dir)
+
+    print(f"✅ Pruned model saved at: {save_dir} with updated neuron dimensions.")
+
+
 
 
 if __name__ == "__main__":
@@ -117,10 +162,10 @@ if __name__ == "__main__":
     from utils import MODEL2PATH
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1")
-    parser.add_argument("--batch_size", type=int, default=3)
-    parser.add_argument("--num_samples", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=5)
+    parser.add_argument("--num_samples", type=int, default=-1)
     parser.add_argument("--task", type=str, default="language_modeling", choices=["language_modeling", "QA"])
-    parser.add_argument("--sparsity", type=float, default=0.2)
+    parser.add_argument("--sparsity", type=float, default=0.1)
     # parser.add_argument("--save_intermediate_outputs", action="store_true")
     parser.add_argument("--pruning_target", type=str, default="mlp", choices=["attn", "mlp", "all"])
     args = parser.parse_args()
@@ -167,3 +212,18 @@ if __name__ == "__main__":
     prune_model(model, dataloader, sparsity=sparsity, pruning_target=pruning_target, device=device)
     # Evaluate the pruned model
     eval_metrics(args.task, model, dataset, tokenizer, max_length=max_length, batch_size=batch_size)
+    # Save the pruned model
+    save_pruned_model(model, save_dir=f"{model_name}_pruned_{sparsity}_{pruning_target}")
+
+    # Try to load from checkpoint and eval again to see if it works
+    model = AutoModelForCausalLM.from_pretrained(
+        f"{model_name}_pruned_{sparsity}_{pruning_target}",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        use_cache=True,
+        attn_implementation="flash_attention_2",
+    )
+    model.eval()  # Move model to GPU for faster evaluation
+    eval_metrics(args.task, model, dataset, tokenizer, max_length=max_length, batch_size=batch_size)
+    print("Done!")

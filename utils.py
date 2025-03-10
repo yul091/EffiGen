@@ -1,3 +1,6 @@
+
+from typing import Any, Dict, Optional, List
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -72,3 +75,43 @@ def plot_distributions(distribution, ax, fig, xrange=None, yrange=None, Zmin=Non
 
     # Remove tick lines
     ax.tick_params(axis='both', which='both', length=0)
+
+
+
+class Task:
+    def __init__(
+        self, 
+        task_id: int, 
+        query: Dict[str, Any], 
+        rate_lambda: float,
+        feedback: Optional[Any] = None,  
+        require_training: Optional[bool] = None,
+        start: Optional[float] = None,
+    ):
+        self.task_id = task_id
+        self.query = query
+        self.rate_lambda = rate_lambda
+        self.feedback = feedback
+        self.require_training = False if require_training is None else require_training
+        self.hybrid_batch = None
+        # Define do_backward for selective training: initially set to require_training
+        self.do_backward = False if require_training is None else require_training
+        self.start = start
+        self.decode_step = 0
+        # self.batch_decode_steps = []
+
+
+def record_time(
+    device: int, 
+    event_type: str, 
+    opt_type: str, 
+    taskID: int,
+    timing_info: Dict[str, List[float]], 
+    verbose: bool = False,
+) -> float:
+    # event_type can be 'start' or 'end'
+    timestamp = time.time()
+    timing_info[f"{device}_{event_type}"].append((timestamp, opt_type, taskID))
+    if verbose:
+        print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
+    return timestamp
