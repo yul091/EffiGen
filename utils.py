@@ -3,6 +3,8 @@ from typing import Any, Dict, Optional, List
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+from collections import OrderedDict
+import json
 
 
 MODEL2PATH = {
@@ -86,17 +88,16 @@ class Task:
         rate_lambda: float,
         feedback: Optional[Any] = None,  
         require_training: Optional[bool] = None,
-        start: Optional[float] = None,
     ):
         self.task_id = task_id
         self.query = query
         self.rate_lambda = rate_lambda
         self.feedback = feedback
         self.require_training = False if require_training is None else require_training
-        self.hybrid_batch = None
+        # self.hybrid_batch = None
         # Define do_backward for selective training: initially set to require_training
         self.do_backward = False if require_training is None else require_training
-        self.start = start
+        # self.start = start
         self.decode_step = 0
         # self.batch_decode_steps = []
 
@@ -115,3 +116,21 @@ def record_time(
     if verbose:
         print(f"\t[CUDA {device}] Task {event_type} at time {timestamp}")
     return timestamp
+
+
+def save_metrics_with_order(metrics: dict, filepath: str):
+    # Extract keys with float or int values
+    prioritized_keys = [k for k, v in metrics.items() if isinstance(v, (float, int))]
+    # Create a reordered dictionary
+    reordered_metrics = OrderedDict()
+    for key in prioritized_keys:
+        reordered_metrics[key] = metrics[key]  # Add prioritized keys first
+    for key, value in metrics.items():
+        if key not in prioritized_keys:
+            reordered_metrics[key] = value  # Add remaining keys
+    
+    # Save the reordered dictionary as JSON
+    with open(filepath, 'w') as f:
+        json.dump(reordered_metrics, f, indent=4)
+    print(f"Metrics saved with reordered keys to {filepath}")
+

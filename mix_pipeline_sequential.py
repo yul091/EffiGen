@@ -2,13 +2,20 @@
 
 import sys
 sys.dont_write_bytecode = True
+from typing import Optional, List
+import logging
 import torch
 import time
 import argparse
-from transformers import set_seed, AutoConfig, AutoTokenizer, AutoModelForCausalLM
+import queue
+from peft import LoraConfig, get_peft_model
+from transformers import set_seed, AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, StoppingCriteriaList, MaxLengthCriteria, MinLengthLogitsProcessor
 import gc
 from mix_pipeline_base import BasicPipeline
 from utils import Task, record_time
+scaler = torch.amp.GradScaler("cuda")  # Add this during initialization
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
 def run_experiment(args, model, tokenizer, device, experimentID: int):
@@ -29,7 +36,7 @@ def run_experiment(args, model, tokenizer, device, experimentID: int):
 
     # Rerun if necessary based on specific conditions
     if record_mode and args.run_mode == 'online':  # Assuming record_mode is a valid arg
-        new_run = llm_pipeline(args, experimentID=experimentID)
+        new_run = SequentialPipeline(args, model, tokenizer, device, experimentID=experimentID)
         new_run.run()
         
         # Final clean up
@@ -60,33 +67,76 @@ class SequentialPipeline(BasicPipeline):
 
     
     
-    def device_inference(self, timing_info, preloaded_tasks, deviceQueue, device = None):
+    def device_inference(
+        self, 
+        preloaded_tasks: List[Task], 
+        deviceQueue: queue.PriorityQueue, 
+        timing_info: Optional[dict] = None, 
+        device: Optional[int] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_length: Optional[int] = None,
+    ):
+        timing_info = timing_info if timing_info is not None else self.timing_info
+        device = device if device is not None else self.device
+        max_length = max_length if max_length is not None else 128
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([MinLengthLogitsProcessor(10, eos_token_id=self.tokenizer.eos_token_id),])
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])
+        
        
         while True:
-            # log_queue_contents(deviceQueue, nodeID, stageID)
+            # If some tasks are currently being trained, wait for them to finish
+            while self.isBatchTraining:
+                time.sleep(0.1)
+
             priority, taskID = deviceQueue.get()
-            # print(f"Retrieved task {taskID} from deviceQueue")
+            print(f"Retrieved task {taskID} from deviceQueue")
 
             if taskID == float('inf'):
                 # Signal that this thread is done
-                print(f" Received termination signal, ending inference.")
+                print(f"Received termination signal, ending inference.")
                 break
             
             task: Task = preloaded_tasks[taskID]
-            batch_size, input_length = task.query['input_ids'].shape
             assert task.task_id == taskID
-            inputs = task.query
+
+            if not task.require_training:
+                hybrid_batch = self.continuous_serving_batching(
+                    taskID=taskID, 
+                    priority=priority, 
+                    task=task, 
+                    deviceQueue=deviceQueue, 
+                    preloaded_tasks=preloaded_tasks, 
+                    max_wait_time=0.1,
+                )  
+            else:
+                hybrid_batch = self.continuous_training_batching(
+                    taskID=taskID, 
+                    priority=priority, 
+                    task=task, 
+                    deviceQueue=deviceQueue, 
+                    preloaded_tasks=preloaded_tasks, 
+                    max_wait_time=0.1,
+                )  
             
-            if inputs is None:
+            if hybrid_batch is None:
                 print(f"Waiting for inputs for task {taskID}")
-                continue    
+                continue   
+            batch_size, input_length = hybrid_batch['input_ids'].shape
                 
             # prepare inputs
-            task.feedback = inputs.pop('labels', None)
+            task.feedback = hybrid_batch.pop('labels', None)
 
             # Memory check and scale down if necessary
             if self.wait_for_device_availability(device):
-                outputs = self.forward(task, inputs, device, timing_info)
+                outputs = self.forward(
+                    taskID=taskID, 
+                    inputs=hybrid_batch, 
+                    device=device, 
+                    timing_info=timing_info, 
+                    require_training=task.require_training, 
+                    labels=task.feedback,
+                )
             else:
                 outputs = None
                 print(f"Failed waiting for device {device} to be available, dropping task {taskID}")
@@ -97,18 +147,16 @@ class SequentialPipeline(BasicPipeline):
                 continue
                 
             loss = outputs.loss
+            # print(f"Finished task {taskID} with loss {loss}")
             # self.metrics["loss"].append(loss.item())
             if task.require_training:
                 self.metrics["train_loss"].append(loss.item())
             else:
-                self.metrics["inference_loss"].append(loss.item())
-            # print(f"[Node {nodeID} | Stage {stageID}] Finished task {taskID} with loss {loss} (tuple outputs {tuple_outputs})")
-
-            # if self.RECORD_MODE:
-            #     self.record_dict['loss'].append((loss.item(), taskID))
-            #     self.record_dict['length'].append((input_length, taskID))
+                self.autoregressive_decoding(
+                    hybrid_batch, logits_processor, stopping_criteria, device, batch_size, lm_logits=outputs[1],
+                )
             
-            if task.do_backward and self.wait_for_device_availability(device, force_check=False):
+            if task.do_backward and self.wait_for_device_availability(device, force_check=True):
                 # Backprop on the last stage
                 bb = time.time()
                 self.task_trace['bb'] = bb
@@ -116,62 +164,38 @@ class SequentialPipeline(BasicPipeline):
                     self.train_trace[taskID]['bb'] = bb # update the recorded time
                     self.all_trace[taskID]['bb'] = bb # update the recorded time
                 try:
-                    loss.backward()
+                    # loss.backward()
+                    scaler.scale(loss).backward()
                     be = record_time(device, 'end', 'backward', taskID, timing_info)
                     self.task_trace['be'] = be
                     if taskID in self.train_trace:
                         self.train_trace[taskID]['be'] = be   
                         self.all_trace[taskID]['be'] = be
                     
-                    if self.backward_eta is None:
-                        self.backward_eta = (be - bb) / (batch_size * input_length ** 2)
-                        
                     print("Stage {} finish backward propagation for task {} !".format(device, taskID))
                 except Exception as e:
-                    # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Backward error occurred: {e}")
+                    logging.error(f"[task {taskID}] Backward error occurred: {e}")
                     pass
 
-                # self._trained_task_lengths.append(input_length)
-
-                # if self.RECORD_MODE:  # In RECORD_MODE, we do not update the model parameters
-                #     self.record_dict['backward_etas'].append(
-                #         ((be - bb) / (self.num_gpus_per_node * batch_size * input_length ** 2), taskID)
-                #     )
-                #     self.record_dict['BTs'].append(((be - bb)/self.num_gpus_per_node, taskID))
-                    
-                # else:  
                 # Optimization
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # for stability
+                # Ensure scaler is initialized before calling step()
                 try:
-                    self.optimizer.step()
-                    # scaler.step(self.distributed_optimizers[nodeID])
-                    self.optimizer.step()
-                    # scaler.update()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad()
                 except Exception as e:
-                    # logging.error(f"[node {nodeID} | stage {stageID} | task {taskID}] Optimization error occurred: {e}")  
-                    pass     
+                    # logging.error(f"[task {taskID}] Optimization error occurred: {e}")  
+                    pass
                 
                 self.optimizer.zero_grad() # clear gradients
                 
-                # if (self.setting == 'isolated') and (len(self._trained_task_lengths) % self.saving_steps == 0): 
-                #     # Save the parameters of stages in the last node and load them in other nodes
-                #     print(f" *** Save checkpoint {self.ckpt_path} *** ")
-                #     for j in range(self.num_gpus_per_node):
-                #         torch.save(self.distributed_stages[nodeID][j].state_dict(), f"{self.ckpt_path}_stage{j}.pt")
-                #     # For other nodes, load the parameters from the last node
-                #     for i in self._test_nodes:
-                #         print(f" *** Load checkpoint for Node {i} *** ")
-                #         for j in range(self.num_gpus_per_node):
-                #             self.distributed_stages[i][j].load_state_dict(torch.load(f"{self.ckpt_path}_stage{j}.pt"))
-                
-                self._training_step += 1
+                # self._training_step += 1
 
-            # # Update task stats
-            # self.distributed_nodes[nodeID].updata_task_stats(
-            #     taskID=taskID, 
-            #     loss=loss.item(), 
-            #     length=input_length, 
-            #     computation_type='training' if task.do_backward else 'test',
-            # )  
+            if task.require_training:
+                self.training_batch.clear()
+                self.isBatchTraining = False
+ 
 
 
 
@@ -183,8 +207,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='Llama-2-7b-chat-hf', help='model name')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
     parser.add_argument('--device', type=int, default=0, help='device ID')
-    parser.add_argument('--max_wait', type=float, default=10, 
-                        help='maximum time to wait from available memory')
+    parser.add_argument('--max_wait', type=float, default=10, help='maximum time to wait from available memory')
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
     parser.add_argument('--save_length', action='store_true', help='save the length of each task')
@@ -238,6 +261,19 @@ if __name__ == '__main__':
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
     ).to(args.device)
+
+    # Apply LoRA configuration
+    lora_config = LoraConfig(
+        r=8,  # LoRA rank
+        lora_alpha=16,  # Scaling factor
+        target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
+        lora_dropout=0.05,
+        task_type="CAUSAL_LM",
+        bias="none"
+    )
+
+    # Wrap model with LoRA
+    model = get_peft_model(model, lora_config)
     
     for i in range(args.experiments):
         run_experiment(args, model, tokenizer, args.device, i)
