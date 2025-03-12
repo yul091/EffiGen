@@ -1,109 +1,362 @@
 
 import math
 import tqdm
+from typing import List, Dict, Any, Union, Optional
+import numpy as np
 import torch
+from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
+from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
 from torch.utils.data import DataLoader, Dataset
 
 
 # === Load Test Dataset ===
-class DPOTESTDataset(Dataset):
-    def __init__(self, data_path, tokenizer, split='test', n_samples=None):
-        self.tokenizer = tokenizer
-        self.data = load_dataset(data_path)[split]
-        if n_samples is not None:
-            # Randomly select n_samples from the dataset
-            self.data = self.data.select(range(n_samples))
+# class DPOTESTDataset(Dataset):
+#     def __init__(self, data_path, tokenizer, split='test', n_samples=None):
+#         self.tokenizer = tokenizer
+#         self.data = load_dataset(data_path)[split]
+#         if n_samples is not None:
+#             # Randomly select n_samples from the dataset
+#             self.data = self.data.select(range(n_samples))
             
-    def __len__(self):
-        return len(self.data)
+#     def __len__(self):
+#         return len(self.data)
 
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        context = item["context"]
-        chosen = item["chosen_response"]
-        rejected = item["rejected_response"]
+#     def __getitem__(self, idx):
+#         item = self.data[idx]
+#         context = item["context"]
+#         chosen = item["chosen_response"]
+#         rejected = item["rejected_response"]
 
-        # Compute context length (used for masking)
-        context_enc = tokenizer(context, return_tensors="pt")
-        context_len = context_enc["input_ids"].shape[1]
+#         # Compute context length (used for masking)
+#         context_enc = tokenizer(context, return_tensors="pt")
+#         context_len = context_enc["input_ids"].shape[1]
 
-        chosen_tokens = self.tokenizer(context + "\n\n" + chosen, return_tensors="pt", )  # shape: (1, seq_len)
-        rejected_tokens = self.tokenizer(context + "\n\n" + rejected, return_tensors="pt", )  # shape: (1, seq_len)
+#         chosen_tokens = self.tokenizer(context + "\n\n" + chosen, return_tensors="pt", )  # shape: (1, seq_len)
+#         rejected_tokens = self.tokenizer(context + "\n\n" + rejected, return_tensors="pt", )  # shape: (1, seq_len)
 
-        # Create labels (ignore context tokens by setting them to `-100`)
-        labels = chosen_tokens["input_ids"].clone()
-        # labels[:context_len] = -100  # Ignore context tokens in loss
-        labels[..., :context_len] = -100
+#         # Create labels (ignore context tokens by setting them to `-100`)
+#         labels = chosen_tokens["input_ids"].clone()
+#         labels[..., :context_len] = -100  # Ignore context tokens in loss
 
-        return {
-            "chosen_input_ids": chosen_tokens["input_ids"].squeeze(0),
-            "chosen_attention_mask": chosen_tokens["attention_mask"].squeeze(0),
-            "chosen_labels": labels.squeeze(0),
-            "rejected_input_ids": rejected_tokens["input_ids"].squeeze(0),
-            "rejected_attention_mask": rejected_tokens["attention_mask"].squeeze(0),
+#         return {
+#             "chosen_input_ids": chosen_tokens["input_ids"].squeeze(0),
+#             "chosen_attention_mask": chosen_tokens["attention_mask"].squeeze(0),
+#             "chosen_labels": labels.squeeze(0),
+#             "rejected_input_ids": rejected_tokens["input_ids"].squeeze(0),
+#             "rejected_attention_mask": rejected_tokens["attention_mask"].squeeze(0),
+#         }
+    
+
+# Define batch tokenization
+def tokenize_and_align_labels(examples):
+    """Tokenizes inputs in batch and masks out context for chosen labels."""
+    contexts = examples["context"]
+    chosens = examples["chosen_response"]
+    rejecteds = examples["rejected_response"]
+
+    # Tokenize all inputs in batch mode
+    chosen_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, chosens)],
+                                 truncation=True, padding=False,  # Use dynamic padding later during collation
+                                 max_length=max_length)
+    
+    rejected_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, rejecteds)],
+                                   truncation=True, padding=False,  # Use dynamic padding later during collation
+                                   max_length=max_length)
+
+    # Tokenize context separately (to get its length)
+    context_encodings = tokenizer(contexts, truncation=True, padding=False, max_length=max_length)
+    context_lengths = [len(enc) for enc in context_encodings["input_ids"]]
+
+    # Create labels: Mask out context tokens by setting them to `-100`
+    chosen_labels = [
+        [-100] * ctx_len + chosen_encodings["input_ids"][i][ctx_len:]
+        for i, ctx_len in enumerate(context_lengths)
+    ]
+
+    return {
+        "chosen_input_ids": chosen_encodings["input_ids"],
+        "chosen_attention_mask": chosen_encodings["attention_mask"],
+        "chosen_labels": chosen_labels,
+        "rejected_input_ids": rejected_encodings["input_ids"],
+        "rejected_attention_mask": rejected_encodings["attention_mask"],
+    }
+
+
+
+# class Collator:
+#     """Custom collator to pad input sequences dynamically, ensuring proper masking of padding in labels."""
+#     def __init__(self, tokenizer):
+#         self.tokenizer = tokenizer
+
+#     def __call__(self, batch):
+#         chosen_input_ids = [torch.tensor(b["chosen_input_ids"]) for b in batch]
+#         chosen_attention_masks = [torch.tensor(b["chosen_attention_mask"]) for b in batch]
+#         chosen_labels = [torch.tensor(b["chosen_labels"]) for b in batch]
+#         rejected_input_ids = [torch.tensor(b["rejected_input_ids"]) for b in batch]
+#         rejected_attention_masks = [torch.tensor(b["rejected_attention_mask"]) for b in batch]
+
+#         # Pad sequences dynamically
+#         chosen_input_ids = torch.nn.utils.rnn.pad_sequence(chosen_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+#         chosen_attention_masks = torch.nn.utils.rnn.pad_sequence(chosen_attention_masks, batch_first=True, padding_value=0)
+#         rejected_input_ids = torch.nn.utils.rnn.pad_sequence(rejected_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+#         rejected_attention_masks = torch.nn.utils.rnn.pad_sequence(rejected_attention_masks, batch_first=True, padding_value=0)
+
+#         # Convert labels to tensor & pad
+#         chosen_labels = torch.nn.utils.rnn.pad_sequence(chosen_labels, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+
+#         # **Mask padding tokens to -100** in labels (ignoring padding in loss)
+#         chosen_labels[chosen_labels == self.tokenizer.pad_token_id] = -100
+
+#         return {
+#             "chosen_input_ids": chosen_input_ids,
+#             "chosen_attention_mask": chosen_attention_masks,
+#             "chosen_labels": chosen_labels,
+#             "rejected_input_ids": rejected_input_ids,
+#             "rejected_attention_mask": rejected_attention_masks,
+#         }
+
+
+@dataclass
+class DPOCollator:
+    """
+    Custom data collator for DPO, ensuring dynamic padding of input sequences and labels.
+    Uses `tokenizer.pad()` to respect `padding_side`, ensuring proper alignment.
+    """
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    label_pad_token_id: int = -100
+    return_tensors: str = "pt"
+
+    def __call__(self, features: List[Dict[str, Any]], return_tensors=None):
+        if return_tensors is None:
+            return_tensors = self.return_tensors
+
+
+        # Pad `chosen_*` components
+        chosen_features = [
+            {
+                "input_ids": feature["chosen_input_ids"],
+                "attention_mask": feature["chosen_attention_mask"]
+            }
+            for feature in features
+        ]
+        padded_chosen = self.tokenizer.pad(
+            chosen_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=return_tensors,
+        )
+
+        # Pad `rejected_*` components
+        rejected_features = [
+            {
+                "input_ids": feature["rejected_input_ids"],
+                "attention_mask": feature["rejected_attention_mask"]
+            }
+            for feature in features
+        ]
+        padded_rejected = self.tokenizer.pad(
+            rejected_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=return_tensors,
+        )
+
+        # Process `chosen_labels` separately since tokenizer.pad() does not handle custom labels
+        chosen_labels = [feature["chosen_labels"] for feature in features]
+        max_label_length = max(len(l) for l in chosen_labels)
+
+        if self.pad_to_multiple_of is not None:
+            max_label_length = (
+                (max_label_length + self.pad_to_multiple_of - 1)
+                // self.pad_to_multiple_of
+                * self.pad_to_multiple_of
+            )
+
+        padding_side = self.tokenizer.padding_side
+        # Apply padding to labels, ensuring consistency with tokenizer's padding side
+        for feature in features:
+            remainder = [self.label_pad_token_id] * (max_label_length - len(feature["chosen_labels"]))
+            if isinstance(feature["chosen_labels"], list):
+                feature["chosen_labels"] = (
+                    feature["chosen_labels"] + remainder if padding_side == "right" else remainder + feature["chosen_labels"]
+                )
+            else:
+                feature["chosen_labels"] = np.concatenate(
+                    [feature["chosen_labels"], remainder] if padding_side == "right" else [remainder, feature["chosen_labels"]]
+                ).astype(np.int64)
+
+        # Convert `chosen_labels` to tensor
+        padded_chosen_labels = torch.tensor([feature["chosen_labels"] for feature in features])
+
+        # Ensure padding tokens in labels are set to `-100`
+        padded_chosen_labels[padded_chosen_labels == self.tokenizer.pad_token_id] = -100
+
+        # Construct final batch
+        batch = {
+            "chosen_input_ids": padded_chosen["input_ids"],
+            "chosen_attention_mask": padded_chosen["attention_mask"],
+            "chosen_labels": padded_chosen_labels,
+            "rejected_input_ids": padded_rejected["input_ids"],
+            "rejected_attention_mask": padded_rejected["attention_mask"],
         }
 
+        return batch
+
+
+
 # === Compute Preference Accuracy (Win Rate), Compute Contrastive Log Probability Difference (CLPD) ===
-def evaluate(model, dataset, tokenizer):
+# def compute_metrics(model, dataset, tokenizer):
+#     model.eval()
+#     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+#     wins = 0
+#     total = 0
+#     total_perplexity = 0.0
+#     total_loss = 0.0
+#     logp_diffs = []
+
+#     for batch in tqdm.tqdm(dataloader, total=len(dataloader), desc="Evaluating preferance"):
+#         chosen_input = batch["chosen_input_ids"].cuda()
+#         chosen_attention_mask = batch["chosen_attention_mask"].cuda()
+#         chosen_labels = batch["chosen_labels"].cuda()
+#         rejected_input = batch["rejected_input_ids"].cuda()
+#         rejected_attention_mask = batch["rejected_attention_mask"].cuda()
+
+#         # Compute log probability of chosen and rejected responses
+#         with torch.no_grad():
+#             chosen_outputs = model(
+#                 input_ids=chosen_input,
+#                 attention_mask=chosen_attention_mask,
+#                 labels=chosen_labels,
+#             )
+#             rejected_logits = model(
+#                 input_ids=rejected_input,
+#                 attention_mask=rejected_attention_mask,
+#             ).logits
+
+#         chosen_loss = chosen_outputs.loss
+#         chosen_logits = chosen_outputs.logits
+
+#         # Compute perplexity (exp(loss))
+#         total_loss += chosen_loss.item()
+#         chosen_ppl = torch.exp(chosen_loss).item()
+#         total_perplexity += chosen_ppl
+
+#         # Compare log probabilities (last token)
+#         chosen_logp = torch.log_softmax(chosen_logits[:, -1, :], dim=-1)
+#         rejected_logp = torch.log_softmax(rejected_logits[:, -1, :], dim=-1)
+
+#         # Compute **Contrastive Log Probability Difference (CLPD)**
+#         logp_diff = (chosen_logp.mean() - rejected_logp.mean()).item()
+#         logp_diffs.append(logp_diff)
+
+#         # If chosen has higher log probability, count as win
+#         if chosen_logp.mean() > rejected_logp.mean():
+#             wins += 1
+#         total += 1
+
+#     accuracy = wins / total
+#     print(f"Preference accuracy (Win Rate): {accuracy:.4f}")
+#     avg_clpd = sum(logp_diffs) / total
+#     print(f"Average contrastive log probability difference (CLPD): {avg_clpd:.4f}")
+#     avg_ppl = total_perplexity / total
+#     print(f"Average perplexity (PPL): {avg_ppl:.4f}")
+#     return accuracy, avg_clpd, avg_ppl
+
+
+def compute_batch_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """We hope to compute loss for each sample in the batch. Set  in CrossEntropyLoss."""
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss(reduction="none")
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), 
+            shift_labels.view(-1),
+        )  # shape: (batch_size * (seq_length - 1))
+        # Reshape to (batch_size, seq_length - 1)
+        per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
+        # Compute token-wise mean loss per sequence (batch_size,)
+        loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
+        per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
+    return per_sample_loss
+
+
+def compute_metrics(model, dataloader, device):
     model.eval()
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-    wins = 0
-    total = 0
+    total_correct = 0
+    total_samples = 0
+    total_log_prob_diff = 0.0
     total_perplexity = 0.0
     total_loss = 0.0
-    logp_diffs = []
 
-    for batch in tqdm.tqdm(dataloader, total=len(dataloader), desc="Evaluating preferance"):
-        chosen_input = batch["chosen_input_ids"].cuda()
-        chosen_attention_mask = batch["chosen_attention_mask"].cuda()
-        chosen_labels = batch["chosen_labels"].cuda()
-        rejected_input = batch["rejected_input_ids"].cuda()
-        rejected_attention_mask = batch["rejected_attention_mask"].cuda()
+    with torch.no_grad():
+        for batch in tqdm.tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-        # Compute log probability of chosen and rejected responses
-        with torch.no_grad():
-            chosen_outputs = model(
-                input_ids=chosen_input,
-                attention_mask=chosen_attention_mask,
-                labels=chosen_labels,
+            # Forward pass (one pass for chosen with labels)
+            outputs = model(
+                input_ids=batch["chosen_input_ids"],
+                attention_mask=batch["chosen_attention_mask"],
+                # labels=batch["chosen_labels"],
             )
+            # chosen_loss = outputs.loss
+            # total_loss += chosen_loss.item()
+            chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
+            # print(f"Batch loss shape: {chosen_loss.shape}")
+            total_loss += chosen_loss.sum().item()
+
+            # Compute perplexity (exp(loss))
+            chosen_ppl = torch.exp(chosen_loss).sum().item()
+            total_perplexity += chosen_ppl
+
+            # For Preference Accuracy & CLPD
+            chosen_logits = outputs.logits[:, -1, :]
             rejected_logits = model(
-                input_ids=rejected_input,
-                attention_mask=rejected_attention_mask,
-            ).logits
+                input_ids=batch["rejected_input_ids"],
+                attention_mask=batch["rejected_attention_mask"]
+            ).logits[:, -1, :]
 
-        chosen_loss = chosen_outputs.loss
-        chosen_logits = chosen_outputs.logits
+            # Compute Preference Accuracy (Win Rate)
+            chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
+            rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
+            correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1)).sum().item()
+            total_correct += correct_preds
+            total_samples += chosen_probs.shape[0]
 
-        # Compute perplexity (exp(loss))
-        total_loss += chosen_loss.item()
-        chosen_ppl = torch.exp(chosen_loss).item()
-        total_perplexity += chosen_ppl
+            # Compute Contrastive Log Probability Difference (CLPD)
+            log_prob_diff = (chosen_probs - rejected_probs).mean().item()
+            total_log_prob_diff += log_prob_diff
 
-        # Compare log probabilities (last token)
-        chosen_logp = torch.log_softmax(chosen_logits[:, -1, :], dim=-1)
-        rejected_logp = torch.log_softmax(rejected_logits[:, -1, :], dim=-1)
+    # Compute final averages
+    preference_accuracy = total_correct / total_samples
+    avg_clpd = total_log_prob_diff / len(dataloader)
+    # avg_perplexity = total_perplexity / len(dataloader)
+    # avg_loss = total_loss / len(dataloader)
+    avg_perplexity = total_perplexity / total_samples
+    avg_loss = total_loss / total_samples
 
-        # Compute **Contrastive Log Probability Difference (CLPD)**
-        logp_diff = (chosen_logp.mean() - rejected_logp.mean()).item()
-        logp_diffs.append(logp_diff)
-
-        # If chosen has higher log probability, count as win
-        if chosen_logp.mean() > rejected_logp.mean():
-            wins += 1
-        total += 1
-
-    accuracy = wins / total
-    print(f"Preference accuracy (Win Rate): {accuracy:.4f}")
-    avg_clpd = sum(logp_diffs) / total
-    print(f"Average contrastive log probability difference (CLPD): {avg_clpd:.4f}")
-    avg_ppl = total_perplexity / total
-    print(f"Average perplexity (PPL): {avg_ppl:.4f}")
-    return accuracy, avg_clpd, avg_ppl
+    return {
+        "Preference accuracy": preference_accuracy,
+        "Contrastive log probability difference (CLPD)": avg_clpd,
+        "Perplexity": avg_perplexity,
+        "Loss": avg_loss,
+    }
 
 
 
@@ -114,11 +367,10 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(f"Padd token ID: {tokenizer.pad_token_id}")
 
-    # Load test dataset and compute accuracy
-    test_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='test', n_samples=100)
-    train_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='train')
-    # print(f"test dataset [0]: {test_dataset[0]}")
+    # test_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='test', n_samples=100)
+    # train_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='train')
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -138,6 +390,35 @@ if __name__ == "__main__":
     )
     # Wrap model with LoRA
     model = get_peft_model(model, lora_config)
-    evaluate(model, test_dataset, tokenizer)
+    max_length = model.config.max_position_embeddings
+    
+    # Load and process datasets
+    rlhf_data = load_dataset("data/Anthropic")
+    test_samples=100
+    test_dataset = rlhf_data["test"].select(range(test_samples))
+    train_dataset = rlhf_data["train"]
+    processed_test_dataset = test_dataset.map(
+        tokenize_and_align_labels, 
+        batched=True, 
+        load_from_cache_file=False,
+    ).remove_columns(test_dataset.column_names)
+    # print(f"Processed test dataset[0]: {processed_test_dataset[0]}")
+
+    # Instantiate collator with tokenizer
+    collator = DPOCollator(tokenizer)
+
+    # Create DataLoader
+    batch_size = 4  # Adjust as needed
+    test_dataloader = DataLoader(
+        processed_test_dataset,  # Use test split
+        batch_size=batch_size,
+        collate_fn=collator,  # Use custom collator
+        shuffle=False,  # No need to shuffle test set
+    )
+    # print("Batch[0]: ", {k: v.shape for k, v in next(iter(test_dataloader)).items()})
+
+    # compute_metrics(model, test_dataset, tokenizer)
+    metrics = compute_metrics(model, test_dataloader, device=model.device)
+    print(metrics)
 
 
