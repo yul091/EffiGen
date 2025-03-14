@@ -7,9 +7,9 @@ import torch
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, LoraModel, get_peft_model
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
 from torch.utils.data import DataLoader, Dataset
 
@@ -200,7 +200,7 @@ class DPOCollator:
 
         # Ensure padding tokens in labels are set to `-100`
         padded_chosen_labels[padded_chosen_labels == self.tokenizer.pad_token_id] = -100
-
+    
         # Construct final batch
         batch = {
             "chosen_input_ids": padded_chosen["input_ids"],
@@ -273,28 +273,28 @@ class DPOCollator:
 #     return accuracy, avg_clpd, avg_ppl
 
 
-def compute_batch_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-) -> torch.Tensor:
-    """We hope to compute loss for each sample in the batch. Set  in CrossEntropyLoss."""
-    loss = None
-    if labels is not None:
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss_fct = CrossEntropyLoss(reduction="none")
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), 
-            shift_labels.view(-1),
-        )  # shape: (batch_size * (seq_length - 1))
-        # Reshape to (batch_size, seq_length - 1)
-        per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
-        # Compute token-wise mean loss per sequence (batch_size,)
-        loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
-        per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
-    return per_sample_loss
+# def compute_batch_loss(
+#     logits: torch.Tensor,
+#     labels: torch.Tensor,
+# ) -> torch.Tensor:
+#     """We hope to compute loss for each sample in the batch. Set  in CrossEntropyLoss."""
+#     loss = None
+#     if labels is not None:
+#         # Shift so that tokens < n predict n
+#         shift_logits = logits[..., :-1, :].contiguous()
+#         shift_labels = labels[..., 1:].contiguous()
+#         # Flatten the tokens
+#         loss_fct = CrossEntropyLoss(reduction="none")
+#         loss = loss_fct(
+#             shift_logits.view(-1, shift_logits.size(-1)), 
+#             shift_labels.view(-1),
+#         )  # shape: (batch_size * (seq_length - 1))
+#         # Reshape to (batch_size, seq_length - 1)
+#         per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
+#         # Compute token-wise mean loss per sequence (batch_size,)
+#         loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
+#         per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
+#     return per_sample_loss
 
 
 def compute_metrics(model, dataloader, device):
@@ -313,16 +313,16 @@ def compute_metrics(model, dataloader, device):
             outputs = model(
                 input_ids=batch["chosen_input_ids"],
                 attention_mask=batch["chosen_attention_mask"],
-                # labels=batch["chosen_labels"],
+                labels=batch["chosen_labels"],
             )
-            # chosen_loss = outputs.loss
-            # total_loss += chosen_loss.item()
-            chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
-            # print(f"Batch loss shape: {chosen_loss.shape}")
-            total_loss += chosen_loss.sum().item()
+            chosen_loss = outputs.loss
+            total_loss += chosen_loss.item()
+            # chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
+            # total_loss += chosen_loss.sum().item()
 
             # Compute perplexity (exp(loss))
-            chosen_ppl = torch.exp(chosen_loss).sum().item()
+            chosen_ppl = torch.exp(chosen_loss).item()
+            # chosen_ppl = torch.exp(chosen_loss).sum().item()
             total_perplexity += chosen_ppl
 
             # For Preference Accuracy & CLPD
@@ -346,10 +346,10 @@ def compute_metrics(model, dataloader, device):
     # Compute final averages
     preference_accuracy = total_correct / total_samples
     avg_clpd = total_log_prob_diff / len(dataloader)
-    # avg_perplexity = total_perplexity / len(dataloader)
-    # avg_loss = total_loss / len(dataloader)
-    avg_perplexity = total_perplexity / total_samples
-    avg_loss = total_loss / total_samples
+    avg_perplexity = total_perplexity / len(dataloader)
+    avg_loss = total_loss / len(dataloader)
+    # avg_perplexity = total_perplexity / total_samples
+    # avg_loss = total_loss / total_samples
 
     return {
         "Preference accuracy": preference_accuracy,
@@ -360,14 +360,100 @@ def compute_metrics(model, dataloader, device):
 
 
 
+# === DPO Loss Function ===
+def dpo_loss(model, batch, beta=0.1):
+    """Computes DPO contrastive loss from logits"""
+    chosen_logits = model(input_ids=batch["chosen_input_ids"], attention_mask=batch["chosen_attention_mask"]).logits
+    rejected_logits = model(input_ids=batch["rejected_input_ids"], attention_mask=batch["rejected_attention_mask"]).logits
+
+    # Get loss at last token
+    chosen_logps = F.log_softmax(chosen_logits[:, -1, :], dim=-1)  # Last token log-probs, shape: (batch_size, vocab_size)
+    rejected_logps = F.log_softmax(rejected_logits[:, -1, :], dim=-1)  # Last token log-probs, shape: (batch_size, vocab_size)
+
+    # Contrastive objective: prefer chosen
+    loss = -F.logsigmoid(beta * (chosen_logps - rejected_logps)).mean()
+    return loss
+
+
+# === Training Loop with Trainer ===
+class DPOTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        
+        loss = dpo_loss(model, inputs)
+        # loss = model(inputs["chosen_input_ids"], labels=inputs["chosen_labels"]).loss
+        if not loss.requires_grad:
+            raise ValueError(f"Loss {loss} does not require gradient!")
+            # print(f"Loss dtype: {loss.dtype}, requires_grad: {loss.requires_grad}")
+        return (loss, None) if return_outputs else loss
+
+
+
+def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1):
+    # Set model to training mode
+    model.train()
+
+    # Define optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5) if optimizer is None else optimizer
+
+    # Use automatic mixed precision (for memory efficiency)
+    scaler = torch.amp.GradScaler("cuda") if scaler is None else scaler
+
+
+    # Training loop
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        total_loss = 0
+        model.train()  # Ensure model is in training mode
+
+        tq = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", total=len(train_dataloader))
+        for step, batch in enumerate(tq):
+            optimizer.zero_grad()  # Reset gradients
+
+            # Move batch to GPU
+            batch = {k: v.cuda() for k, v in batch.items()}
+
+            with torch.amp.autocast("cuda"):  # Mixed precision
+                loss = dpo_loss(model, batch)
+            # loss = dpo_loss(model, batch)
+
+            if not loss.requires_grad:
+                raise ValueError(f"Loss does not require gradients at step {step}!")
+
+            # Backward pass
+            scaler.scale(loss).backward()
+
+            # Gradient update
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+            tq.set_postfix({"Loss": loss.item(), "Avg Loss": total_loss / (step + 1)})
+
+            # # Print loss every 10 steps
+            # if step % 10 == 0:
+            #     print(f"Step {step}, Loss: {loss.item()}")
+
+        # Print epoch loss
+        avg_loss = total_loss / len(train_dataloader)
+        print(f"Epoch {epoch + 1} finished, Avg Loss: {avg_loss}")
+
+    print("Training complete!")
+
+
+
+
 if __name__ == "__main__":
+    import os
+
+    # EXPORT the first CUDA device for this program
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
     # === Load Model & Tokenizer ===
     model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        print(f"Padd token ID: {tokenizer.pad_token_id}")
 
     # test_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='test', n_samples=100)
     # train_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='train')
@@ -375,9 +461,10 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         low_cpu_mem_usage=True,
-        # device_map="auto",
+        torch_dtype=torch.float16,
+        device_map="auto",
         use_cache=True,
-    ).cuda()  # Load fine-tuned model
+    )  # Load fine-tuned model
 
     # Apply LoRA configuration
     lora_config = LoraConfig(
@@ -390,13 +477,19 @@ if __name__ == "__main__":
     )
     # Wrap model with LoRA
     model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()  # Should list LoRA parameters as trainable
+
+    # Ensure LoRA layers require gradient
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            assert param.requires_grad, f"LoRA parameter {name} is frozen!"
+    
     max_length = model.config.max_position_embeddings
     
     # Load and process datasets
     rlhf_data = load_dataset("data/Anthropic")
-    test_samples=100
+    test_samples = min(1000, len(rlhf_data["test"]))
     test_dataset = rlhf_data["test"].select(range(test_samples))
-    train_dataset = rlhf_data["train"]
     processed_test_dataset = test_dataset.map(
         tokenize_and_align_labels, 
         batched=True, 
@@ -408,17 +501,63 @@ if __name__ == "__main__":
     collator = DPOCollator(tokenizer)
 
     # Create DataLoader
-    batch_size = 4  # Adjust as needed
+    serving_batch_size = 2  # Adjust as needed
     test_dataloader = DataLoader(
         processed_test_dataset,  # Use test split
-        batch_size=batch_size,
+        batch_size=serving_batch_size,
         collate_fn=collator,  # Use custom collator
         shuffle=False,  # No need to shuffle test set
     )
     # print("Batch[0]: ", {k: v.shape for k, v in next(iter(test_dataloader)).items()})
 
-    # compute_metrics(model, test_dataset, tokenizer)
-    metrics = compute_metrics(model, test_dataloader, device=model.device)
-    print(metrics)
+    # Evaluate before LoRA fine-tuning
+    metrics = compute_metrics(model, test_dataloader, device="cuda")
+    print(f"[Before training] {metrics}")
 
+    # Training args
+    training_batch_size = 1  # Adjust as needed
+    # training_args = TrainingArguments(
+    #     per_device_train_batch_size=training_batch_size,
+    #     gradient_accumulation_steps=6,  # Simulate larger batch size
+    #     learning_rate=5e-5,
+    #     num_train_epochs=1,
+    #     logging_steps=10,
+    #     report_to="none",  # Disable logging
+    #     output_dir=f"./dpo_lora/{model_name.split('/')[-1]}",
+    #     save_strategy="no",  #"epoch",
+    #     # bf16=True,  # Mixed precision
+    #     # fp16=True,  # <<< Use fp16 instead of bf16
+    #     optim="adamw_torch",
+    #     remove_unused_columns=False,  # Avoids accidental column drops
+    # )
 
+    # Train model
+    train_samples = min(200, len(rlhf_data["train"]))
+    train_dataset = rlhf_data["train"].select(range(train_samples))
+    processed_train_dataset = train_dataset.map(
+        tokenize_and_align_labels, 
+        batched=True, 
+        load_from_cache_file=False,
+    ).remove_columns(train_dataset.column_names)
+    
+    # # Sanity check
+    train_dataloader = DataLoader(
+        processed_train_dataset,  # Use test split
+        batch_size=training_batch_size,
+        collate_fn=collator,  # Use custom collator
+        shuffle=True,  # No need to shuffle test set
+    )
+
+    # trainer = DPOTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=processed_train_dataset,
+    #     data_collator=collator,
+    #     tokenizer=tokenizer,
+    # )
+    # trainer.train()
+    training_loop(model, train_dataloader, num_epochs=1)
+
+    # Evaluate after LoRA fine-tuning
+    metrics = compute_metrics(model, test_dataloader, device="cuda")
+    print(f"[After training] {metrics}")
