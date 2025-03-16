@@ -1,6 +1,7 @@
 
 import math
 import tqdm
+import json
 from typing import List, Dict, Any, Union, Optional
 import numpy as np
 import torch
@@ -297,6 +298,49 @@ class DPOCollator:
 #     return per_sample_loss
 
 
+def compute_batch_metrics(model, batch, device):
+    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+    # Forward pass (one pass for chosen with labels)
+    with torch.no_grad():
+        outputs = model(
+            input_ids=batch["chosen_input_ids"],
+            attention_mask=batch["chosen_attention_mask"],
+            labels=batch["chosen_labels"],
+        )
+    # chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
+    # total_loss += chosen_loss.sum().item()
+    chosen_loss = outputs.loss
+
+    # Compute perplexity (exp(loss))
+    chosen_ppl = torch.exp(chosen_loss)
+    # chosen_ppl = torch.exp(chosen_loss).sum().item()
+
+    # For Preference Accuracy & CLPD
+    chosen_logits = outputs.logits[:, -1, :]
+    rejected_logits = model(
+        input_ids=batch["rejected_input_ids"],
+        attention_mask=batch["rejected_attention_mask"]
+    ).logits[:, -1, :]
+
+    # Compute Preference Accuracy (Win Rate)
+    chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
+    rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
+    correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1)).sum()
+
+    # Compute Contrastive Log Probability Difference (CLPD)
+    log_prob_diff = (chosen_probs - rejected_probs).mean()
+
+    return {
+        "loss": chosen_loss.item(),
+        "perplexity": chosen_ppl.item(),
+        "correct_preds": correct_preds.item(),
+        "batch_samples": chosen_probs.shape[0],
+        "log_prob_diff": log_prob_diff.item(),
+    }
+
+
+
 def compute_metrics(model, dataloader, device):
     model.eval()
     total_correct = 0
@@ -305,43 +349,15 @@ def compute_metrics(model, dataloader, device):
     total_perplexity = 0.0
     total_loss = 0.0
 
-    with torch.no_grad():
-        for batch in tqdm.tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
-            batch = {k: v.to(device) for k, v in batch.items()}
+    
+    for batch in tqdm.tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
+        eval_outputs = compute_batch_metrics(model, batch, device)
 
-            # Forward pass (one pass for chosen with labels)
-            outputs = model(
-                input_ids=batch["chosen_input_ids"],
-                attention_mask=batch["chosen_attention_mask"],
-                labels=batch["chosen_labels"],
-            )
-            chosen_loss = outputs.loss
-            total_loss += chosen_loss.item()
-            # chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
-            # total_loss += chosen_loss.sum().item()
-
-            # Compute perplexity (exp(loss))
-            chosen_ppl = torch.exp(chosen_loss).item()
-            # chosen_ppl = torch.exp(chosen_loss).sum().item()
-            total_perplexity += chosen_ppl
-
-            # For Preference Accuracy & CLPD
-            chosen_logits = outputs.logits[:, -1, :]
-            rejected_logits = model(
-                input_ids=batch["rejected_input_ids"],
-                attention_mask=batch["rejected_attention_mask"]
-            ).logits[:, -1, :]
-
-            # Compute Preference Accuracy (Win Rate)
-            chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
-            rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
-            correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1)).sum().item()
-            total_correct += correct_preds
-            total_samples += chosen_probs.shape[0]
-
-            # Compute Contrastive Log Probability Difference (CLPD)
-            log_prob_diff = (chosen_probs - rejected_probs).mean().item()
-            total_log_prob_diff += log_prob_diff
+        total_loss += eval_outputs["loss"]
+        total_perplexity += eval_outputs["perplexity"]
+        total_correct += eval_outputs["correct_preds"]
+        total_samples += eval_outputs["batch_samples"]
+        total_log_prob_diff += eval_outputs["log_prob_diff"]
 
     # Compute final averages
     preference_accuracy = total_correct / total_samples
@@ -388,25 +404,66 @@ class DPOTrainer(Trainer):
 
 
 
-def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1):
-    # Set model to training mode
-    model.train()
-
+def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1, test_iter=None, test_train_rate=1, samples_per_train=1):
+    """Simple training loop for DPO model"""
     # Define optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5) if optimizer is None else optimizer
-
-    # Use automatic mixed precision (for memory efficiency)
     scaler = torch.amp.GradScaler("cuda") if scaler is None else scaler
+    metrics = {}
 
-
-    # Training loop
     for epoch in range(num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs}")
-        total_loss = 0
-        model.train()  # Ensure model is in training mode
+        train_loss = 0  # for training
+        eval_steps = 0
+        total_correct, total_samples = 0, 0
+        total_perplexity, total_log_prob_diff, eval_loss = 0, 0, 0
+        perplexities, log_prob_diffs, eval_losses, corrects, preds = [], [], [], [], []
 
         tq = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", total=len(train_dataloader))
         for step, batch in enumerate(tq):
+
+            # Evaluate every `test_train_rate` steps
+            if test_iter is not None and ((step + 1) % (samples_per_train // train_dataloader.batch_size) == 0 or step == 0):
+                model.eval()
+                iter_samples = min(test_train_rate * samples_per_train // test_dataloader.batch_size, len(test_dataloader) // 2)
+                # for _ in range(iter_samples):
+                eval_tq = tqdm.tqdm(range(iter_samples), desc="Evaluating", total=iter_samples)
+                for _ in eval_tq:
+                    try:
+                        eval_batch = next(test_iter)
+                    except StopIteration:
+                        break
+                    
+                    # Compute metrics
+                    eval_outputs = compute_batch_metrics(model, eval_batch, "cuda")
+                    eval_steps += 1
+                    
+                    eval_loss += eval_outputs["loss"]
+                    avg_eval_loss = eval_loss / eval_steps
+                    eval_losses.append(eval_outputs["loss"])
+
+                    total_perplexity += eval_outputs["perplexity"]
+                    avg_perplexity = total_perplexity / eval_steps
+                    perplexities.append(eval_outputs["perplexity"])
+
+                    total_correct += eval_outputs["correct_preds"]
+                    total_samples += eval_outputs["batch_samples"]
+                    corrects.append(eval_outputs["correct_preds"])
+                    preds.append(eval_outputs["batch_samples"])
+                    avg_preference_accuracy = total_correct / total_samples
+                    total_log_prob_diff += eval_outputs["log_prob_diff"]
+                    avg_log_prob_diff = total_log_prob_diff / eval_steps
+                    log_prob_diffs.append(eval_outputs["log_prob_diff"])
+                
+                    eval_tq.set_postfix({
+                        "Avg Eval Loss": avg_eval_loss,
+                        "Avg PPL": avg_perplexity,
+                        "Avg Pref Acc": avg_preference_accuracy,
+                        "Avg CLPD": avg_log_prob_diff,
+                    })
+
+            # Ensure model is in training mode
+            model.train()  
             optimizer.zero_grad()  # Reset gradients
 
             # Move batch to GPU
@@ -426,18 +483,25 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
             scaler.step(optimizer)
             scaler.update()
 
-            total_loss += loss.item()
-            tq.set_postfix({"Loss": loss.item(), "Avg Loss": total_loss / (step + 1)})
+            train_loss += loss.item()
+            tq.set_postfix({"Loss": loss.item(), "Avg Loss": train_loss / (step + 1)})
 
-            # # Print loss every 10 steps
-            # if step % 10 == 0:
-            #     print(f"Step {step}, Loss: {loss.item()}")
+            
+        if test_iter is not None:
+            metrics[epoch] = {
+                "perplexities": perplexities,
+                "losses": eval_losses,
+                "corrects": corrects,
+                "preds": preds,
+                "CLPDs": log_prob_diffs,
+            }           
 
         # Print epoch loss
-        avg_loss = total_loss / len(train_dataloader)
-        print(f"Epoch {epoch + 1} finished, Avg Loss: {avg_loss}")
+        avg_train_loss = train_loss / len(train_dataloader)
+        print(f"Epoch {epoch + 1} finished, Avg Loss: {avg_train_loss}")
 
     print("Training complete!")
+    return metrics
 
 
 
@@ -447,6 +511,10 @@ if __name__ == "__main__":
 
     # EXPORT the first CUDA device for this program
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # Set reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
 
     # === Load Model & Tokenizer ===
     model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -468,7 +536,7 @@ if __name__ == "__main__":
 
     # Apply LoRA configuration
     lora_config = LoraConfig(
-        r=8,  # LoRA rank
+        r=16,  # LoRA rank
         lora_alpha=16,  # Scaling factor
         target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
         lora_dropout=0.05,
@@ -487,8 +555,18 @@ if __name__ == "__main__":
     max_length = model.config.max_position_embeddings
     
     # Load and process datasets
+    test_train_rate = 5
     rlhf_data = load_dataset("data/Anthropic")
-    test_samples = min(1000, len(rlhf_data["test"]))
+    train_samples = min(1000, len(rlhf_data["train"]))
+    train_dataset = rlhf_data["train"].select(range(train_samples))
+    processed_train_dataset = train_dataset.map(
+        tokenize_and_align_labels, 
+        batched=True, 
+        load_from_cache_file=False,
+    ).remove_columns(train_dataset.column_names)
+
+
+    test_samples = min(train_samples * test_train_rate, len(rlhf_data["test"]))
     test_dataset = rlhf_data["test"].select(range(test_samples))
     processed_test_dataset = test_dataset.map(
         tokenize_and_align_labels, 
@@ -506,16 +584,18 @@ if __name__ == "__main__":
         processed_test_dataset,  # Use test split
         batch_size=serving_batch_size,
         collate_fn=collator,  # Use custom collator
-        shuffle=False,  # No need to shuffle test set
+        shuffle=True,  # No need to shuffle test set
     )
+    # Convert DataLoader to an explicit iterator
+    test_iter = iter(test_dataloader)
     # print("Batch[0]: ", {k: v.shape for k, v in next(iter(test_dataloader)).items()})
 
-    # Evaluate before LoRA fine-tuning
-    metrics = compute_metrics(model, test_dataloader, device="cuda")
-    print(f"[Before training] {metrics}")
+    # # Evaluate before LoRA fine-tuning
+    # metrics = compute_metrics(model, test_dataloader, device="cuda")
+    # print(f"[Before training] {metrics}")
 
     # Training args
-    training_batch_size = 1  # Adjust as needed
+    training_batch_size = 2  # Adjust as needed
     # training_args = TrainingArguments(
     #     per_device_train_batch_size=training_batch_size,
     #     gradient_accumulation_steps=6,  # Simulate larger batch size
@@ -531,15 +611,6 @@ if __name__ == "__main__":
     #     remove_unused_columns=False,  # Avoids accidental column drops
     # )
 
-    # Train model
-    train_samples = min(200, len(rlhf_data["train"]))
-    train_dataset = rlhf_data["train"].select(range(train_samples))
-    processed_train_dataset = train_dataset.map(
-        tokenize_and_align_labels, 
-        batched=True, 
-        load_from_cache_file=False,
-    ).remove_columns(train_dataset.column_names)
-    
     # # Sanity check
     train_dataloader = DataLoader(
         processed_train_dataset,  # Use test split
@@ -556,8 +627,21 @@ if __name__ == "__main__":
     #     tokenizer=tokenizer,
     # )
     # trainer.train()
-    training_loop(model, train_dataloader, num_epochs=1)
 
-    # Evaluate after LoRA fine-tuning
-    metrics = compute_metrics(model, test_dataloader, device="cuda")
-    print(f"[After training] {metrics}")
+    print(f"Eval steps per train: {test_train_rate}")
+    samples_per_train = training_batch_size
+    # samples_per_train = train_samples
+    eval_metrics = training_loop(
+        model, 
+        train_dataloader, 
+        test_iter=test_iter, 
+        test_train_rate=test_train_rate,
+        samples_per_train=samples_per_train,
+    )
+    # Save eval_metrics to json file (indent for readability)
+    with open(f"eval_metrics-{test_train_rate}-{samples_per_train}.json", "w") as f:
+        json.dump(eval_metrics, f, indent=4)
+
+    # # Evaluate after LoRA fine-tuning
+    # metrics = compute_metrics(model, test_dataloader, device="cuda")
+    # print(f"[After training] {metrics}")
