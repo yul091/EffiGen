@@ -80,6 +80,8 @@ def tokenize_and_align_labels(examples):
     ]
 
     return {
+        "context_input_ids": context_encodings["input_ids"],
+        "context_attention_mask": context_encodings["attention_mask"],
         "chosen_input_ids": chosen_encodings["input_ids"],
         "chosen_attention_mask": chosen_encodings["attention_mask"],
         "chosen_labels": chosen_labels,
@@ -138,6 +140,22 @@ class DPOCollator:
     def __call__(self, features: List[Dict[str, Any]], return_tensors=None):
         if return_tensors is None:
             return_tensors = self.return_tensors
+
+        # Pad `context_*` components
+        context_features = [
+            {
+                "input_ids": feature["context_input_ids"],
+                "attention_mask": feature["context_attention_mask"]
+            }
+            for feature in features
+        ]
+        padded_context = self.tokenizer.pad(
+            context_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=return_tensors,
+        )
 
 
         # Pad `chosen_*` components
@@ -204,6 +222,8 @@ class DPOCollator:
     
         # Construct final batch
         batch = {
+            "context_input_ids": padded_context["input_ids"],
+            "context_attention_mask": padded_context["attention_mask"],
             "chosen_input_ids": padded_chosen["input_ids"],
             "chosen_attention_mask": padded_chosen["attention_mask"],
             "chosen_labels": padded_chosen_labels,
@@ -404,7 +424,7 @@ class DPOTrainer(Trainer):
 
 
 
-def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1, test_iter=None, test_train_rate=1, samples_per_train=1):
+def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1, test_iter=None, test_train_rate=1, samples_per_train=1, output_generation=False):
     """Simple training loop for DPO model"""
     # Define optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5) if optimizer is None else optimizer
@@ -418,6 +438,7 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
         total_correct, total_samples = 0, 0
         total_perplexity, total_log_prob_diff, eval_loss = 0, 0, 0
         perplexities, log_prob_diffs, eval_losses, corrects, preds = [], [], [], [], []
+        test_generations = []
 
         tq = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", total=len(train_dataloader))
         for step, batch in enumerate(tq):
@@ -462,6 +483,20 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
                         "Avg CLPD": avg_log_prob_diff,
                     })
 
+
+                    # Generate outputs (optional)
+                    if output_generation:
+                        outputs = model.generate(
+                            input_ids=eval_batch["context_input_ids"].to(model.device),
+                            attention_mask=eval_batch["context_attention_mask"].to(model.device),
+                            # max_length=128,
+                            max_new_tokens=128,
+                            num_beams=4,
+                        )
+                        output_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                        print(f"Generated: \n{output_texts}")
+                        test_generations.extend(output_texts)
+
             # Ensure model is in training mode
             model.train()  
             optimizer.zero_grad()  # Reset gradients
@@ -494,7 +529,9 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
                 "corrects": corrects,
                 "preds": preds,
                 "CLPDs": log_prob_diffs,
-            }           
+            }        
+            if output_generation:
+                metrics[epoch]["generations"] = test_generations   
 
         # Print epoch loss
         avg_train_loss = train_loss / len(train_dataloader)
@@ -532,6 +569,7 @@ if __name__ == "__main__":
         torch_dtype=torch.float16,
         device_map="auto",
         use_cache=True,
+        attn_implementation="flash_attention_2",
     )  # Load fine-tuned model
 
     # Apply LoRA configuration
@@ -557,7 +595,7 @@ if __name__ == "__main__":
     # Load and process datasets
     test_train_rate = 5
     rlhf_data = load_dataset("data/Anthropic")
-    train_samples = min(1000, len(rlhf_data["train"]))
+    train_samples = min(50, len(rlhf_data["train"]))
     train_dataset = rlhf_data["train"].select(range(train_samples))
     processed_train_dataset = train_dataset.map(
         tokenize_and_align_labels, 
@@ -629,17 +667,18 @@ if __name__ == "__main__":
     # trainer.train()
 
     print(f"Eval steps per train: {test_train_rate}")
-    samples_per_train = training_batch_size
-    # samples_per_train = train_samples
+    # samples_per_train = training_batch_size
+    samples_per_train = train_samples
     eval_metrics = training_loop(
         model, 
         train_dataloader, 
         test_iter=test_iter, 
         test_train_rate=test_train_rate,
         samples_per_train=samples_per_train,
+        output_generation=True,
     )
     # Save eval_metrics to json file (indent for readability)
-    with open(f"eval_metrics-{test_train_rate}-{samples_per_train}.json", "w") as f:
+    with open(f"eval_metrics-{train_samples}-{test_train_rate}-{samples_per_train}.json", "w") as f:
         json.dump(eval_metrics, f, indent=4)
 
     # # Evaluate after LoRA fine-tuning

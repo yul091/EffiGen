@@ -1,10 +1,50 @@
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union
+from collections.abc import Mapping
+from transformers.cache_utils import DynamicCache
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 import json
+import torch
+
+
+
+def _prepare_input(
+    data: Union[torch.Tensor, Any],
+    device: torch.device = 'cuda',
+) -> Union[torch.Tensor, Any]:
+    """
+    Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+    """
+    if isinstance(data, Mapping):
+        return type(data)({k: _prepare_input(v, device) for k, v in data.items()})
+    elif isinstance(data, (tuple, list)):
+        return type(data)(_prepare_input(v, device) for v in data)
+    elif isinstance(data, DynamicCache):
+        data.key_cache = _prepare_input(data.key_cache, device)
+        data.value_cache = _prepare_input(data.value_cache, device)
+    elif isinstance(data, torch.Tensor):
+        kwargs = {"device": device}
+        return data.to(**kwargs)
+    return data
+    
+
+def prepare_inputs(
+    inputs: Dict[str, Union[torch.Tensor, Any]],
+    device: torch.device = 'cuda',
+) -> Dict[str, Union[torch.Tensor, Any]]:
+    """
+    Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
+    handling potential state.
+    """
+    new_inputs = _prepare_input(inputs, device=device)
+    if new_inputs is None or len(new_inputs) == 0:
+        raise ValueError(
+            "The batch received was empty, your model won't be able to train on it."
+        )
+    return new_inputs
 
 
 MODEL2PATH = {
@@ -84,15 +124,17 @@ class Task:
     def __init__(
         self, 
         task_id: int, 
-        query: Dict[str, Any], 
+        input_ids: Dict[str, Any], 
+        attention_mask: Dict[str, Any],
         rate_lambda: float,
-        feedback: Optional[Any] = None,  
+        labels: Optional[Any] = None,  
         require_training: Optional[bool] = None,
     ):
         self.task_id = task_id
-        self.query = query
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
         self.rate_lambda = rate_lambda
-        self.feedback = feedback
+        self.labels = labels
         self.require_training = False if require_training is None else require_training
         # self.hybrid_batch = None
         # Define do_backward for selective training: initially set to require_training

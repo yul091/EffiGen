@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import DataCollatorForSeq2Seq, LlamaForCausalLM, LlamaTokenizer, get_scheduler
 from concurrent.futures import ThreadPoolExecutor
-from models import prepare_decoding_inputs, prepare_inputs, pad_batch
+# from models import prepare_decoding_inputs, prepare_inputs, pad_batch
 from utils import Task, record_time, save_metrics_with_order
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -92,13 +92,15 @@ class BasicPipeline:
         # Preloaded datasets
         self.dataset = dataset
         self.dataset = self.dataset.shuffle(seed=42)
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=1,  # Online training or serving
-            collate_fn=self.data_collator,
-        )
+        # self.dataloader = DataLoader(
+        #     self.dataset,
+        #     batch_size=1,  # Online training or serving
+        #     collate_fn=self.data_collator,
+        # )
         self.preloaded_tasks, self.total_tasks, self.num_training_samples, self.training_taskIDs = self.get_preloaded_dataset(
-            dataloader=self.dataloader, retraining_rate=self.retraining_rate,
+            # dataloader=self.dataloader, 
+            dataset=self.dataset,
+            retraining_rate=self.retraining_rate,
         )
         self.inference_taskIDs = [i for i, t in enumerate(self.preloaded_tasks) if not t.require_training]
         print(f"Total tasks: {self.total_tasks} | Training tasks: {self.num_training_samples}")
@@ -122,19 +124,22 @@ class BasicPipeline:
 
     def get_preloaded_dataset(
         self,
-        dataloader: Optional[DataLoader] = None, 
+        # dataloader: Optional[DataLoader] = None, 
+        dataset: Optional[torch.utils.data.Dataset] = None,
         retraining_rate: Optional[float] = None,
     ) -> Tuple[List[Task], int, int, List[int]]:
         
         print("Using preloaded data ...")
-        dataloader = dataloader if dataloader is not None else self.dataloader
+        # dataloader = dataloader if dataloader is not None else self.dataloader
+        dataset = dataset if dataset is not None else self.dataset
         retraining_rate = retraining_rate if retraining_rate is not None else self.retraining_rate
         total_tasks, retraining_taskIDs, preloaded_tasks = 0, [], []
         
         selected_data = []
-        for i, batch in enumerate(dataloader):
-            seq_length = batch['input_ids'].shape[1]
-            selected_data.append((seq_length, batch))
+        for i, instance in enumerate(dataset):
+            # seq_length = batch['input_ids'].shape[1]
+            seq_length = len(instance['input_ids'])
+            selected_data.append((seq_length, instance))
         
         # If workload is 'alternate', we need to create a list of varying lambda values 
         # (e.g., 5, 5, ..., 10, 10, ..., 30, 30, ..., 50, 50, ...), each for 20 consecutive tasks
@@ -155,20 +160,23 @@ class BasicPipeline:
                 idx = (idx + 1) % len(lambda_values)
             
         # Create preloaded tasks with each one on a specific CUDA device
-        for taskID, (_, batch) in enumerate(selected_data):
+        # for taskID, (_, batch) in enumerate(selected_data):
+        for taskID, (seq_length, instance) in enumerate(selected_data):
             lamda = self.rate_lambda if self.rate_lambda != -1 else task_lambdas[taskID]
             # 10% of the time, produce a task with feedback
             require_training = random.random() < retraining_rate
             total_tasks += 1
             if require_training: 
                 retraining_taskIDs.append(i)
-                batch = prepare_decoding_inputs(batch)
+                # batch = prepare_decoding_inputs(batch)
             
             task = Task(
                 task_id=taskID,
                 rate_lambda=lamda,
-                query=prepare_inputs(batch, device=self.device),
-                feedback=prepare_inputs(batch['labels'], device=self.device),
+                # query=prepare_inputs(batch, device=self.device),
+                input_ids=instance['input_ids'],
+                attention_mask=instance['attention_mask'],
+                labels=instance['labels'],
                 require_training=require_training,
             )
                 
@@ -232,17 +240,35 @@ class BasicPipeline:
                 break
 
         # Use the data collator to pad and combine the batch
-        input_ids_list = [t.query['input_ids'].squeeze(0) for t in self.serving_batch]
-        attention_mask_list = [t.query['attention_mask'].squeeze(0) for t in self.serving_batch]
-        input_ids = pad_batch(input_ids_list, pad_value=self.tokenizer.pad_token_id)
-        attention_mask = pad_batch(attention_mask_list, pad_value=0)  
+        # input_ids_list = [t.query['input_ids'].squeeze(0) for t in self.serving_batch]
+        # attention_mask_list = [t.query['attention_mask'].squeeze(0) for t in self.serving_batch]
+        context_features = [
+            {
+                "input_ids": task.input_ids,
+                "attention_mask": task.attention_mask,
+            }
+            for task in self.serving_batch
+        ]
+        # print(f"Context features: {context_features}")
+        padded_context = self.tokenizer.pad(
+            context_features,
+            padding=True,
+            pad_to_multiple_of=None,
+            return_tensors="pt",
+        )
+        # print(f"Padded context: {padded_context}")
+        # input_ids = pad_batch(input_ids_list, pad_value=self.tokenizer.pad_token_id)
+        # attention_mask = pad_batch(attention_mask_list, pad_value=0)  
+
 
         # Update the current task to use the collated batch
         self.isBatchServing = True
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": input_ids.clone(),
+            # "input_ids": input_ids,
+            # "attention_mask": attention_mask,
+            "input_ids": padded_context['input_ids'],
+            "attention_mask": padded_context['attention_mask'],
+            "labels": padded_context['input_ids'].clone(),
         }
 
 
@@ -282,19 +308,35 @@ class BasicPipeline:
                 break
 
         # Use the data collator to pad and combine the batch
-        input_ids_list = [t.query['input_ids'].squeeze(0) for t in self.training_batch]
-        attention_mask_list = [t.query['attention_mask'].squeeze(0) for t in self.training_batch]
-        label_list = [t.feedback.squeeze(0) for t in self.training_batch]
-        input_ids = pad_batch(input_ids_list, pad_value=self.tokenizer.pad_token_id)
-        attention_mask = pad_batch(attention_mask_list, pad_value=0)  
-        labels = pad_batch(label_list, pad_value=-100)
+        # input_ids_list = [t.query['input_ids'].squeeze(0) for t in self.training_batch]
+        # attention_mask_list = [t.query['attention_mask'].squeeze(0) for t in self.training_batch]
+        # label_list = [t.feedback.squeeze(0) for t in self.training_batch]
+        context_features = [
+            {
+                "input_ids": t['input_ids'],
+                "attention_mask": t['attention_mask'],
+            }
+            for t in self.training_batch
+        ]
+        padded_context = self.tokenizer.pad(
+            context_features,
+            padding=True,
+            pad_to_multiple_of=None,
+            return_tensors="pt",
+        )
+        # input_ids = pad_batch(input_ids_list, pad_value=self.tokenizer.pad_token_id)
+        # attention_mask = pad_batch(attention_mask_list, pad_value=0)  
+        # labels = pad_batch(label_list, pad_value=-100)
 
         # Update the current task to use the collated batch
         self.isBatchTraining = True
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            # "input_ids": input_ids,
+            # "attention_mask": attention_mask,
+            # "labels": labels,
+            "input_ids": padded_context['input_ids'],
+            "attention_mask": padded_context['attention_mask'],
+            "labels": padded_context['input_ids'].clone(),
         }
 
 
@@ -316,25 +358,37 @@ class BasicPipeline:
         # next_tokens = next_tokens * unfinished_sequences + self.tokenizer.pad_token_id * (1 - unfinished_sequences)
         # Update unfinished sequences
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(self.tokenizer.eos_token_id).long())
-        # print(f"Unfinished sequences: {unfinished_sequences}")
         # Stop when each sentence is finished or if we exceed the maximum length
-        if unfinished_sequences.max() == 0 or stopping_criteria(hybrid_batch["input_ids"], next_tokens_scores):
+        if unfinished_sequences.max() == 0 or stopping_criteria(hybrid_batch["input_ids"], next_tokens_scores).all():
             self.serving_batch.clear()  # Clear the batch
         else:
+            # print(f"Continuing decoding for batch {len(self.serving_batch)}")
             finished_indices = (unfinished_sequences == 0).nonzero(as_tuple=True)[0]
+            # print(f"Finished indices: {finished_indices}")
             # Append generated tokens to the sequence for all tasks in the batch
-            for i, t in enumerate(self.serving_batch):
-                t.query['input_ids'] = torch.cat([t.query['input_ids'], next_tokens[i].view(1, 1)], dim=1)
-                t.query['attention_mask'] = torch.cat(
-                    [t.query['attention_mask'], torch.ones((1, 1), device=device)], dim=1
-                )
-                # print(f"[Current batch  {len(self.serving_batch)} | finished {finished_indices}] task {t.task_id} (index {i}) -> next token {next_tokens[i]}")
+            for i, task in enumerate(self.serving_batch):
+                # task.query['input_ids'] = torch.cat([ttask.query['input_ids'], next_tokens[i].view(1, 1)], dim=1)
+                # task.query['attention_mask'] = torch.cat(
+                #     [task.query['attention_mask'], torch.ones((1, 1), device=device)], dim=1
+                # )
+                task.input_ids.append(next_tokens[i].item())
+                task.attention_mask.append(1)
+                # print(f"[Current batch  {len(self.serving_batch)} | finished {finished_indices}] task {task.task_id} (index {i}) -> next token {next_tokens[i]}")
             # Remove finished sequences from the batch
             if len(finished_indices) > 0:
                 # print(f"Removing finished sequences: {finished_indices}")
-                self.serving_batch = [
-                    t for i, t in enumerate(self.serving_batch) if i not in finished_indices
-                ]
+                for i, task in enumerate(self.serving_batch):
+                    if i in finished_indices:
+                        # # Record the decoding in the user task record
+                        # self.user_task_record[task.task_id]['generation_ids'] = task.input_ids
+                        # Remove the task from the batch
+                        del self.serving_batch[i]
+
+                # self.serving_batch = [
+                #     t for i, t in enumerate(self.serving_batch) if i not in finished_indices
+                # ]
+
+
             # print(f"Remaining tasks: {len(self.node_batches[nodeID])}")
         self.isBatchServing = False
         hybrid_batch = None  # Clear the input no longer needed
@@ -575,6 +629,8 @@ class BasicPipeline:
                         token_decoding_times.append(E2E_decoding_time / decode_step if decode_step > 0 else 0)
                     except KeyError:
                         print(f"Decode step not found for task {taskID}")
+
+                record_dict['generation'] = self.tokenizer.decode(self.preloaded_tasks[taskID].input_ids, skip_special_tokens=True)
                 
                 wait_times.append(record_dict['start'] - record_dict['release'])
                 latencies.append(record_dict['prefill_end'] - record_dict['start'])

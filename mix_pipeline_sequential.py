@@ -1,5 +1,5 @@
 
-
+import os
 import sys
 sys.dont_write_bytecode = True
 from typing import Optional, List
@@ -12,7 +12,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import set_seed, AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, StoppingCriteriaList, MaxLengthCriteria, MinLengthLogitsProcessor
 import gc
 from mix_pipeline_base import BasicPipeline
-from utils import Task, record_time
+from utils import Task, record_time, prepare_inputs
 scaler = torch.amp.GradScaler("cuda")  # Add this during initialization
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -80,8 +80,8 @@ class SequentialPipeline(BasicPipeline):
         timing_info = timing_info if timing_info is not None else self.timing_info
         device = device if device is not None else self.device
         max_length = max_length if max_length is not None else 128
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([MinLengthLogitsProcessor(10, eos_token_id=self.tokenizer.eos_token_id),])
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList([MinLengthLogitsProcessor(10, eos_token_id=self.tokenizer.eos_token_id, device=device),])
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList([MaxLengthCriteria(max_length=max_length, max_position_embeddings=self.model.config.max_position_embeddings),])
         
        
         while True:
@@ -122,10 +122,12 @@ class SequentialPipeline(BasicPipeline):
             if hybrid_batch is None:
                 print(f"Waiting for inputs for task {taskID}")
                 continue   
+
+            hybrid_batch = prepare_inputs(hybrid_batch, device=device)
             batch_size, input_length = hybrid_batch['input_ids'].shape
                 
             # prepare inputs
-            task.feedback = hybrid_batch.pop('labels', None)
+            task.labels = hybrid_batch.pop('labels', None)
 
             # Memory check and scale down if necessary
             if self.wait_for_device_availability(device):
@@ -135,7 +137,7 @@ class SequentialPipeline(BasicPipeline):
                     device=device, 
                     timing_info=timing_info, 
                     require_training=task.require_training, 
-                    labels=task.feedback,
+                    labels=task.labels,
                 )
             else:
                 outputs = None
@@ -152,9 +154,15 @@ class SequentialPipeline(BasicPipeline):
             if task.require_training:
                 self.metrics["train_loss"].append(loss.item())
             else:
-                self.autoregressive_decoding(
-                    hybrid_batch, logits_processor, stopping_criteria, device, batch_size, lm_logits=outputs[1],
-                )
+                try:
+                    self.autoregressive_decoding(
+                        hybrid_batch, logits_processor, stopping_criteria, device, batch_size, lm_logits=outputs[1],
+                    )
+                except Exception as e:
+                    logging.error(f"Error occurred while autoregressive decoding: {e}")
+                    # raise e
+                    # kill the python program
+                    os._exit(1)
             
             if task.do_backward and self.wait_for_device_availability(device, force_check=True):
                 # Backprop on the last stage
@@ -206,7 +214,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name_or_path', type=str, default='meta-llama//Llama-2-7b-chat-hf', help='model name or path')
     parser.add_argument('--model_name', type=str, default='Llama-2-7b-chat-hf', help='model name')
     parser.add_argument('--memory_threshold', type=float, default=0.8, help='threshold for maximum memory allocation in each GPU device')
-    parser.add_argument('--device', type=int, default=0, help='device ID')
+    parser.add_argument('--device', type=int, default=None, help='device ID')
     parser.add_argument('--max_wait', type=float, default=10, help='maximum time to wait from available memory')
     parser.add_argument('--n_samples', type=int, default=-1)
     parser.add_argument('--seed', type=int, default=42, help='random seed')
@@ -260,7 +268,9 @@ if __name__ == '__main__':
         low_cpu_mem_usage=True,
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
-    ).to(args.device)
+        device_map=f"cuda:{args.device}" if args.device is not None else "auto",
+    )
+    print(f"Put model into device {model.device}")
 
     # Apply LoRA configuration
     lora_config = LoraConfig(
