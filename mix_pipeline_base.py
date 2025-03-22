@@ -630,6 +630,7 @@ class BasicPipeline:
                     except KeyError:
                         print(f"Decode step not found for task {taskID}")
 
+                record_dict['prompt'] = self.tokenizer.decode(self.preloaded_tasks[taskID].prompt_ids, skip_special_tokens=True)
                 record_dict['generation'] = self.tokenizer.decode(self.preloaded_tasks[taskID].input_ids, skip_special_tokens=True)
                 
                 wait_times.append(record_dict['start'] - record_dict['release'])

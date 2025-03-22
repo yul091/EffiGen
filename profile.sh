@@ -6,31 +6,18 @@ model_path=mistralai/Mixtral-8x7B-Instruct-v0.1 # meta-llama/Meta-Llama-3-8B-Ins
 head_choice=('reason')
 beta=1.005
 temp=1
-max_output_length=1
-# device=3
+max_output_length=300
+device=0
 # --device ${device} \
 # --prune_mlp \
 # --sparsity 0.5 \
 
 # for max_capacity_prompts in 128; do
-for model_path in mistralai/Mixtral-8x7B-Instruct-v0.1; do
+for model_path in mistralai/Mistral-7B-Instruct-v0.2; do
     # for method in SnapKV PyramidKV; do
     for method in fullkv; do
         save_dir="./results_profile/${method}/results_long_bench_${head_choice}_base${max_capacity_prompts}_beta${beta}_temp${temp}"
-        python run_latency.py \
-            --method ${method} \
-            --model_path ${model_path} \
-            --max_capacity_prompts ${max_capacity_prompts} \
-            --head_choice ${head_choice} \
-            --beta ${beta} \
-            --temp ${temp} \
-            --attn_implementation ${attn_implementation} \
-            --save_dir ${save_dir} \
-            --prune_mlp \
-            --sparsity 0.5 \
-            --use_cache True
-
-        # python run_memory.py \
+        # python run_latency.py \
         #     --method ${method} \
         #     --model_path ${model_path} \
         #     --max_capacity_prompts ${max_capacity_prompts} \
@@ -39,8 +26,22 @@ for model_path in mistralai/Mixtral-8x7B-Instruct-v0.1; do
         #     --temp ${temp} \
         #     --attn_implementation ${attn_implementation} \
         #     --save_dir ${save_dir} \
-        #     --length ${max_output_length} \
+        #     --prune_mlp \
+        #     --sparsity 0.5 \
         #     --use_cache True
+
+        python run_memory.py \
+            --method ${method} \
+            --model_path ${model_path} \
+            --max_capacity_prompts ${max_capacity_prompts} \
+            --head_choice ${head_choice} \
+            --beta ${beta} \
+            --temp ${temp} \
+            --device ${device} \
+            --attn_implementation ${attn_implementation} \
+            --save_dir ${save_dir} \
+            --length ${max_output_length} \
+            --use_cache True
     done
     # done
 done

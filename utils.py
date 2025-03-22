@@ -124,14 +124,15 @@ class Task:
     def __init__(
         self, 
         task_id: int, 
-        input_ids: Dict[str, Any], 
-        attention_mask: Dict[str, Any],
+        input_ids: List[int], 
+        attention_mask: List[int],
         rate_lambda: float,
-        labels: Optional[Any] = None,  
+        labels: Optional[List[int]] = None,  
         require_training: Optional[bool] = None,
     ):
         self.task_id = task_id
         self.input_ids = input_ids
+        self.prompt_ids = input_ids.copy()
         self.attention_mask = attention_mask
         self.rate_lambda = rate_lambda
         self.labels = labels
