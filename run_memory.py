@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation.utils import *
+from peft import LoraConfig, get_peft_model
 
 import datasets
 from datasets import Dataset
@@ -531,15 +532,24 @@ def generate(
 
 def main(args):
     model_path = args.model_path.lower()
-    # lengths = [16, 32, 64, 128, 256, 512, 1024, 2048,]
-    lengths = [128, 256, 512, 1024, 2048, 4096]
-    # batch_sizes = [1, 2, 3, 4, 5, ]
-    batch_sizes = [5,]
-    output_max_len = args.length
+    lengths = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096,]
+    batch_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,]
+    # if args.experiment == "fine-tune":
+    #     batch_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,]
+    # else:
+    if args.experiment != "fine-tune":
+        # batch_sizes = [1, 2, 4, 8, 12, 16, 20, 24, 32]
+        if args.experiment == "prefill":
+            output_max_len = 1
+        else:
+            lengths = [16,]  # for decode, we only need to test one length
+            output_max_len = 4096
+        
+    # output_max_len = args.length
     model_name = model_path.split("/")[-1]
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
-    memory_fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_memory.json"), "w")
+    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_{args.experiment}.json"), "w")
+    # memory_fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_memory.json"), "w")
 
     data_dir = 'reason_needle/babilong-100examples/64k/qa1/'
     file = os.path.join(data_dir, 'data-00000-of-00001.arrow')
@@ -548,6 +558,7 @@ def main(args):
     for i in range(4):
         all_prompt += dataset[i]['input'] + '\n'
     tokens = tokenizer.tokenize(all_prompt)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
     pbar = tqdm(total=len(lengths))
     for index, length in enumerate(lengths):
@@ -563,63 +574,89 @@ def main(args):
             max_memory_allocated_after_input_to_cuda = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
             args.result_data[f"{context_length}:after_input_to_cuda"] = f"{max_memory_allocated_after_input_to_cuda} GB"
 
-            # max_memory_reserved_after_input_to_cuda = get_max_memory_reserved(all_devices) / (1024 * 1024 * 1024)
-            # args.result_data[f"{haystack_size}:max_memory_reserved_after_input_to_cuda"] = f"{max_memory_reserved_after_input_to_cuda} GB"
-                    
-            model.model.config.window_size = 8
-            model.model.config.base_capacity = args.max_capacity_prompts
-            model.model.config.aug_capacity = args.aug_capacity
-            model.model.config.head_choice = args.head_choice
-            model.model.config.top_num = args.top_num
-            model.model.config.beta = args.beta
-            model.model.config.temp = args.temp
-            model.model.config.alpha = args.alpha
-            model.model.config.kernel_size = 7
-            model.model.config.skip = 0
-            model.model.config.normalize = True
-            model.model.config.pooling = "maxpool"
-            model.model.config.floor = 0.2
-            model.model.config.pyram_beta = args.pyram_beta
-
-            start_time = time.perf_counter()
-            output = model.generate(
-                **inputs,
-                output_attentions = args.output_attentions,
-                max_new_tokens=output_max_len,
-                num_beams=1,
-                do_sample=False,
-                temperature=1.0,
-                min_length=context_length+output_max_len,
-                eos_token_id=[tokenizer.eos_token_id],
-                return_dict_in_generate=True,
-            )
-            end_time = time.perf_counter()
-
-            max_memory_allocated_after_generate = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
-            args.result_data[f"{context_length}:after_generate"] = f"{max_memory_allocated_after_generate} GB"
-            args.result_data[f'{context_length}:time'] = end_time - start_time
-
-            # batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
-            batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
-            torch.cuda.empty_cache()
-
-            # max_memory_allocated_after_empty = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
-            # args.result_data[f"{haystack_size}:max_memory_allocated_after_empt"] = f"{max_memory_allocated_after_empty} GB"
-
             example = {}
             example["prompt"] = context
-            example["prompt_length"] = inputs.input_ids.shape[-1]
-            example["pred"] = batch_outputs[0]
-            example["pred_length"] = len(tokenizer.encode(example["pred"]))
+            example["prompt_length"] = length
             example["batch_size"] = batch_size
-            example["length"] = length
-            example["output_max_len"] = output_max_len
-            example["latency"] = end_time - start_time
-            example["memory"] = max_memory_allocated_after_generate - max_memory_allocated_after_input_to_cuda
-            example["model_name"] = model_name
-            example["generation_profile"] = output.profile_res
-            # example['setting'] = f'{index}: context:{length} -- insert:{round(task_start_pct, 2)}~{round(task_end_pct, 2)}'
-            # example["dataset"] = args.dataset
+
+            if args.experiment in ["prefill", "decode"]:
+                model.eval() 
+                start_time = time.perf_counter()
+                try:
+                    output = model.generate(
+                        **inputs,
+                        output_attentions = args.output_attentions,
+                        max_new_tokens=output_max_len,
+                        num_beams=1,
+                        do_sample=False,
+                        temperature=1.0,
+                        min_length=context_length+output_max_len,
+                        eos_token_id=[tokenizer.eos_token_id],
+                        return_dict_in_generate=True,
+                    )
+                
+                    end_time = time.perf_counter()
+
+                    max_memory_allocated_after_generate = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
+                    args.result_data[f"{context_length}:after_generate"] = f"{max_memory_allocated_after_generate} GB"
+                    args.result_data[f'{context_length}:time'] = end_time - start_time
+
+                    # batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+                    batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
+                    torch.cuda.empty_cache()
+                
+                    example["pred"] = batch_outputs[0]
+                    example["pred_length"] = len(tokenizer.encode(example["pred"]))
+                    example["latency"] = end_time - start_time
+                    example["memory"] = max_memory_allocated_after_generate - max_memory_allocated_after_input_to_cuda
+                    example["output_max_len"] = output_max_len
+                    example["generation_profile"] = output.profile_res
+                except Exception as e:
+                    print(e)
+                    example["pred"] = "OOM"
+                    example["pred_length"] = "OOM"
+                    example["latency"] = "OOM"
+                    example["memory"] = "OOM"
+                    example["output_max_len"] = output_max_len
+                    example["generation_profile"] = []
+            
+            elif args.experiment == "fine-tune":
+                example["generation_profile"] = []
+                model.train()
+                inputs["labels"] = inputs.input_ids
+
+                # GPU Memory profiling
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+                try:
+                    loss = model(**inputs).loss
+                    example["loss"] = loss.item()
+                    loss.backward()
+                    # Profiling Results
+                    end_event.record()
+                    torch.cuda.synchronize()  # Ensure all CUDA kernels finish
+                    latency = start_event.elapsed_time(end_event)  # Time in milliseconds
+                    memory_used = torch.cuda.max_memory_allocated(inputs.input_ids.device) / (1024**2)  # MB
+
+                    example["generation_profile"].append({
+                        "operation": "fine-tune",
+                        "cur_length": length,
+                        "latency": latency,
+                        "memory_used": memory_used,
+                    })
+
+                except Exception as e:
+                    print(e)
+                    example["generation_profile"].append({
+                        "operation": "fine-tune",
+                        "cur_length": length,
+                        "latency": "OOM",
+                        "memory_used": "OOM",
+                    })
+
 
             # Dump with indent for better readability
             fout.write(json.dumps(example, indent=4, cls=CustomJSONEncoder) + "\n")
@@ -627,7 +664,7 @@ def main(args):
         # bbar.close()
         pbar.update(1)
 
-    memory_fout.write(json.dumps(args.result_data) + "\n")
+    # memory_fout.write(json.dumps(args.result_data) + "\n")
     pbar.close()
  
 
@@ -659,6 +696,7 @@ if __name__ == "__main__":
     parser.add_argument('--pyram_beta', type=float, default=20)
     parser.add_argument('--length', type=int, default=1)
     parser.add_argument('--device', type=int, default=None)
+    parser.add_argument("--experiment", type=str, default="decode", choices=["prefill", "decode", "fine-tune"])
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
@@ -708,6 +746,18 @@ if __name__ == "__main__":
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation
     )
+
+    # Apply LoRA configuration
+    lora_config = LoraConfig(
+        r=16,  # LoRA rank
+        lora_alpha=16,  # Scaling factor
+        target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
+        lora_dropout=0.05,
+        task_type="CAUSAL_LM",
+        bias="none"
+    )
+    # Wrap model with LoRA
+    model = get_peft_model(model, lora_config)
     
     args.result_data = {}
 
@@ -725,8 +775,6 @@ if __name__ == "__main__":
     # args.result_data["max_memory_reserved_after_load_model"] = f"{max_memory_reserved_after_load_model} GB"
     # Patch generation method
     transformers.generation.utils.GenerationMixin.generate = generate
-
-    model.eval()
     
     save_dir = args.save_dir
 

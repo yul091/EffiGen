@@ -41,6 +41,7 @@ for model_path in mistralai/Mistral-7B-Instruct-v0.2; do
             --attn_implementation ${attn_implementation} \
             --save_dir ${save_dir} \
             --length ${max_output_length} \
+            --experiment "decode" \
             --use_cache True
     done
     # done
