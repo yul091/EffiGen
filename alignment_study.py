@@ -340,7 +340,7 @@ def compute_batch_metrics(model, batch, device):
     chosen_logits = outputs.logits[:, -1, :]
     rejected_logits = model(
         input_ids=batch["rejected_input_ids"],
-        attention_mask=batch["rejected_attention_mask"]
+        attention_mask=batch["rejected_attention_mask"],
     ).logits[:, -1, :]
 
     # Compute Preference Accuracy (Win Rate)
@@ -562,7 +562,6 @@ if __name__ == "__main__":
 
     # test_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='test', n_samples=100)
     # train_dataset = DPOTESTDataset("data/Anthropic", tokenizer, split='train')
-
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         low_cpu_mem_usage=True,
