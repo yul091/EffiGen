@@ -118,7 +118,7 @@ class PrefixSharingTrie:
         self, 
         model: GPT2LMHeadModel, 
         input_tokens: List[int], 
-        # attn_mask: Optional[List[int]] = None,
+        attn_mask: Optional[List[int]] = None,
         use_prefix: Optional[bool] = None, 
         max_new_tokens: Optional[int] = None,
     ):
@@ -160,12 +160,12 @@ class PrefixSharingTrie:
 
         
         input_ids = torch.tensor([input_tokens]).cuda()
-        # attention_mask = torch.tensor([attn_mask]).cuda() if attn_mask is not None else None
+        attention_mask = torch.tensor([attn_mask]).cuda() if attn_mask is not None else None
         # max_memory_allocated_after_input_to_cuda = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
 
         outputs = model.generate(
             inputs=input_ids,
-            # attention_mask=attention_mask,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             past_key_values=past_key_values,
             num_beams=1,
@@ -289,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_samples", type=int, default=None, help="The number of test samples to use.")
     parser.add_argument("--max_depth", type=int, default=256, help="The maximum depth of the trie.")
     parser.add_argument("--attn_implementation", type=str,  default="flash_attention_2", choices=["flash_attention_2", "sdpa", "eager"])
+    parser.add_argument("--dummy_test", action="store_true", help="Use dummy test data.")
     args = parser.parse_args()
     
     if args.device is not None:
@@ -324,35 +325,36 @@ if __name__ == "__main__":
 
     # Insert some queries
     if args.use_prefix:
-        # queries = [
-        #     "What is AI?", 
-        #     "What is AI used for?", 
-        #     "What is AI's impact on society?",
-        # ]
-        # for q in queries:
-        #     print(f"Inserting query: {q}")
-        #     tokenized = tokenizer.encode(q)  # list of token IDs
-        #     prefix_trie.insert(tokenized, model)
-        
-        if args.train_samples is not None:
-            train_samples = min(args.train_samples, len(rlhf_data["train"]))
-            train_dataset = rlhf_data["train"].select(range(train_samples))
+        if args.dummy_test:
+            queries = [
+                "What is AI?", 
+                "What is AI used for?", 
+                "What is AI's impact on society?",
+            ]
+            for q in queries:
+                print(f"Inserting query: {q}")
+                tokenized = tokenizer.encode(q)  # list of token IDs
+                prefix_trie.insert(tokenized, model)
         else:
-            train_dataset = rlhf_data["train"]
-        processed_train_dataset = train_dataset.map(
-            tokenize_and_align_labels, 
-            batched=True, 
-            load_from_cache_file=False,
-        ).remove_columns(train_dataset.column_names)  
+            if args.train_samples is not None:
+                train_samples = min(args.train_samples, len(rlhf_data["train"]))
+                train_dataset = rlhf_data["train"].select(range(train_samples))
+            else:
+                train_dataset = rlhf_data["train"]
+            processed_train_dataset = train_dataset.map(
+                tokenize_and_align_labels, 
+                batched=True, 
+                load_from_cache_file=False,
+            ).remove_columns(train_dataset.column_names)  
 
-        file_path = f"{args.save_dir}/prefix_trie.pkl"
-        if not os.path.exists(file_path):
-            for example in tqdm(processed_train_dataset, desc="Inserting queries", total=len(processed_train_dataset)):
-                prefix_trie.insert(example["context_input_ids"], model)
-            # Also save the prefixsharingtrie class (as pt file) for later use
-            # pickle.dump(prefix_trie, open(file_path, "wb"))
-        else:
-            prefix_trie = pickle.load(open(file_path, "rb"))
+            file_path = f"{args.save_dir}/prefix_trie.pkl"
+            if not os.path.exists(file_path):
+                for example in tqdm(processed_train_dataset, desc="Inserting queries", total=len(processed_train_dataset)):
+                    prefix_trie.insert(example["context_input_ids"], model)
+                # Also save the prefixsharingtrie class (as pt file) for later use
+                # pickle.dump(prefix_trie, open(file_path, "wb"))
+            else:
+                prefix_trie = pickle.load(open(file_path, "rb"))
 
         # # Visualize the trie structure
         # visualizer = TrieVisualizer(prefix_trie, tokenizer)
@@ -360,84 +362,94 @@ if __name__ == "__main__":
         # visualizer.save("figures/trie_graph", file_format="png")  # Saves as trie_graph.png
 
     # Process new query using prefix sharing
-    # text = "What is AI used in medicine?"
-    # print(f"Processing query: {text}")
-    # input_tokens = tokenizer.encode(text)
-    # context_length = len(input_tokens)
+    if args.dummy_test:
+        text = "What is AI used in medicine?"
+        print(f"Processing query: {text}")
+        input_tokens = tokenizer.encode(text)
+        attn_mask = [1] * len(input_tokens)
+        context_length = len(input_tokens)
 
-    if args.test_samples is not None:
-        test_samples = min(args.test_samples, len(rlhf_data["test"]))
-        test_dataset = rlhf_data["test"].select(range(test_samples))
+        # GPU Memory profiling
+        torch.cuda.reset_peak_memory_stats()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        output, _, _ = prefix_trie.generate_with_prefix_sharing(
+            model, 
+            input_tokens, 
+            attn_mask=attn_mask,
+            use_prefix=args.use_prefix, 
+            max_new_tokens=args.output_max_len,
+        )
+        end_event.record()
+        torch.cuda.synchronize()  # Ensure all CUDA kernels finish
+        latency = start_event.elapsed_time(end_event)  # Time in milliseconds
+        memory_used = torch.cuda.max_memory_allocated(model.device) / (1024**2)  # MB
+        print(f"Latency: {latency:.2f} ms, Memory used: {memory_used:.2f} MB")
+        batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
+        print(f"Generated text: {batch_outputs[0]}")
+
     else:
-        test_dataset = rlhf_data["test"]
-    processed_test_dataset = test_dataset.map(
-        tokenize_and_align_labels,
-        batched=True,
-        load_from_cache_file=False,
-    ).remove_columns(test_dataset.column_names)
+        if args.test_samples is not None:
+            test_samples = min(args.test_samples, len(rlhf_data["test"]))
+            test_dataset = rlhf_data["test"].select(range(test_samples))
+        else:
+            test_dataset = rlhf_data["test"]
+        processed_test_dataset = test_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            load_from_cache_file=False,
+        ).remove_columns(test_dataset.column_names)
 
-    optimization = "(prefix_cache)" if args.use_prefix else "(no_cache)"
-    model_name = model_path.split("/")[-1]
-    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_{optimization}_{args.experiment}.json"), "w")
-    batch_sizes = [1]
-    for batch_size in batch_sizes:
-        # for example in tqdm(processed_test_dataset, desc="Processing queries", total=len(processed_test_dataset)):
-        for idx, example in tqdm(enumerate(processed_test_dataset), desc="Processing queries", total=len(processed_test_dataset)):
-            input_tokens = example["context_input_ids"].copy()
-            # attention_mask = example["context_attention_mask"].copy()
-            context_length = len(input_tokens)
+        optimization = "(prefix_cache)" if args.use_prefix else "(no_cache)"
+        model_name = model_path.split("/")[-1]
+        os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
+        fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}_{optimization}_{args.experiment}.json"), "w")
+        batch_sizes = [1]
+        for batch_size in batch_sizes:
+            # for example in tqdm(processed_test_dataset, desc="Processing queries", total=len(processed_test_dataset)):
+            for idx, example in tqdm(enumerate(processed_test_dataset), desc="Processing queries", total=len(processed_test_dataset)):
+                input_tokens = example["context_input_ids"].copy()
+                # attention_mask = example["context_attention_mask"].copy()
+                context_length = len(input_tokens)
 
-            metric = {}
-            metric["prompt"] = test_dataset[idx]["context"]
-            metric["prompt_length"] = context_length
-            metric["batch_size"] = batch_size
+                metric = {}
+                metric["prompt"] = test_dataset[idx]["context"]
+                metric["prompt_length"] = context_length
+                metric["batch_size"] = batch_size
 
-            # GPU Memory profiling
-            model.eval()
-            torch.cuda.reset_peak_memory_stats()
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            output, prefix_tokens, remaining_tokens = prefix_trie.generate_with_prefix_sharing(
-                model, 
-                input_tokens, 
-                use_prefix=args.use_prefix, 
-                max_new_tokens=args.output_max_len,
-            )
-            end_event.record()
-            torch.cuda.synchronize()  # Ensure all CUDA kernels finish
-            latency = start_event.elapsed_time(end_event)  # Time in milliseconds
-            memory_used = torch.cuda.max_memory_allocated(model.device) / (1024**2)  # MB
-            # memory_post = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
-            batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
+                # GPU Memory profiling
+                model.eval()
+                torch.cuda.reset_peak_memory_stats()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                output, prefix_tokens, remaining_tokens = prefix_trie.generate_with_prefix_sharing(
+                    model, 
+                    input_tokens, 
+                    use_prefix=args.use_prefix, 
+                    max_new_tokens=args.output_max_len,
+                )
+                end_event.record()
+                torch.cuda.synchronize()  # Ensure all CUDA kernels finish
+                latency = start_event.elapsed_time(end_event)  # Time in milliseconds
+                memory_used = torch.cuda.max_memory_allocated(model.device) / (1024**2)  # MB
+                # memory_post = get_max_memory_allocated(all_devices) / (1024 * 1024 * 1024)
+                batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
 
-            if args.use_prefix:
-                metric["prefix_length"] = len(prefix_tokens)
-                metric["remaining_tokens"] = len(remaining_tokens)
-            metric["pred"] = batch_outputs[0]
-            metric["pred_length"] = len(tokenizer.encode(metric["pred"]))
-            metric["latency"] = latency  # end_time - start_time
-            metric["memory"] = memory_used # memory_post - memory_pre
-            metric["output_max_len"] = args.output_max_len
-            metric["max_capacity_prompts"] = max_capacity_prompts
-            # metric["generation_profile"] = output.profile_res
+                if args.use_prefix:
+                    metric["prefix_length"] = len(prefix_tokens)
+                    metric["remaining_tokens"] = len(remaining_tokens)
+                metric["pred"] = batch_outputs[0]
+                metric["pred_length"] = len(tokenizer.encode(metric["pred"]))
+                metric["latency"] = latency  # end_time - start_time
+                metric["memory"] = memory_used # memory_post - memory_pre
+                metric["output_max_len"] = args.output_max_len
+                metric["max_capacity_prompts"] = max_capacity_prompts
+                # metric["generation_profile"] = output.profile_res
 
-            # Dump with indent for better readability
-            fout.write(json.dumps(metric, indent=4, cls=CustomJSONEncoder) + "\n")
-            fout.flush()
+                # Dump with indent for better readability
+                fout.write(json.dumps(metric, indent=4, cls=CustomJSONEncoder) + "\n")
+                fout.flush()
 
-    # # GPU Memory profiling
-    # torch.cuda.reset_peak_memory_stats()
-    # start_event = torch.cuda.Event(enable_timing=True)
-    # end_event = torch.cuda.Event(enable_timing=True)
-    # start_event.record()
-    # output, _, _ = prefix_trie.generate_with_prefix_sharing(model, input_tokens, args.use_prefix, max_new_tokens=1)
-    # end_event.record()
-    # torch.cuda.synchronize()  # Ensure all CUDA kernels finish
-    # latency = start_event.elapsed_time(end_event)  # Time in milliseconds
-    # memory_used = torch.cuda.max_memory_allocated(model.device) / (1024**2)  # MB
-    # print(f"Latency: {latency:.2f} ms, Memory used: {memory_used:.2f} MB")
-    # batch_outputs = tokenizer.batch_decode(output.sequences[:, context_length:], skip_special_tokens=True)
-    # print(f"Generated text: {batch_outputs[0]}")
-
+        fout.close()
