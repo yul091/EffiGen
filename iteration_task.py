@@ -68,7 +68,7 @@ class Task:
             return self.base_priority[self.workload] + self.base_factor[self.workload] * (time.time() - self.release_time)
     
     def update_decoding(self, next_token: int) -> None:
-        self.workload = "decode"
+        self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode
         self.step += 1
         # Update the input_kwargs
         self.input_kwargs[self.CONTEXT_FEATURE].append(next_token)

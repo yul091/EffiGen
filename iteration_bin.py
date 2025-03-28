@@ -30,21 +30,24 @@ class IterationBin:
         tokenizer: LlamaTokenizer,
         batch_collator: Optional[DPOCollator] = None,
     ):
-        self.test_batch: List[Task] = []
+        # self.test_batch: List[Task] = []
+        self.prefill_batch: List[Task] = []
+        self.decode_batch: List[Task] = []
         self.train_batch: List[Task] = []
         self.tokenizer = tokenizer
         self.batch_collator = batch_collator if batch_collator is not None else DPOCollator(tokenizer)
         
 
     def add_task(self, task: Task):
-        # if task.workload == "prefill":
-        #     self.prefill_batch.append(task)
-        # elif task.workload == "decode":
-        #     self.decode_batch.append(task)
-        if task.workload == "train":
+        if task.workload == "prefill":
+            self.prefill_batch.append(task)
+        elif task.workload == "decode":
+            self.decode_batch.append(task)
+        elif task.workload == "train":
             self.train_batch.append(task)
         else:
-            self.test_batch.append(task)
+            # self.test_batch.append(task)
+            raise ValueError(f"Invalid workload: {task.workload}")
         
 
     def _create_batch(
@@ -58,34 +61,34 @@ class IterationBin:
         inputs = self.batch_collator(inputs)
         
         inputs["past_key_values"] = None
-        # # TO-DO: pad key values with varient sequence lengths
-        # split_caches = [task.past_key_values for task in batch]
-        # if all(c is None for c in split_caches):  # Handle case where all caches are None
-        #     return prepare_inputs(inputs, device=device)
+        # TO-DO: pad key values with varient sequence lengths
+        split_caches = [task.past_key_values for task in batch]
+        if all(c is None for c in split_caches):  # Handle case where all caches are None
+            return prepare_inputs(inputs, device=device)
        
-        # ref_cache = next(c for c in split_caches if c is not None)
-        # if ref_cache is not None:
-        #     attention_mask = inputs["context_attention_mask"][:, :-1]  # Remove the newly decoded token
-        #     batch_size, max_seq_len = attention_mask.shape
-        #     num_heads, _, head_dim  = ref_cache.key_cache[0].shape
-        #     inputs["past_key_values"] = DynamicCache()
+        ref_cache = next(c for c in split_caches if c is not None)
+        if ref_cache is not None:
+            attention_mask = inputs["context_attention_mask"][:, :-1]  # Remove the newly decoded token
+            batch_size, max_seq_len = attention_mask.shape
+            num_heads, _, head_dim  = ref_cache.key_cache[0].shape
+            inputs["past_key_values"] = DynamicCache()
 
-        #     for layer_idx in range(len(ref_cache.key_cache)):
-        #         key_tensor = torch.zeros(
-        #             (batch_size, num_heads, max_seq_len, head_dim),
-        #             dtype=ref_cache.key_cache[layer_idx].dtype,
-        #             device=ref_cache.key_cache[layer_idx].device,
-        #         )
-        #         value_tensor = torch.zeros_like(key_tensor)
+            for layer_idx in range(len(ref_cache.key_cache)):
+                key_tensor = torch.zeros(
+                    (batch_size, num_heads, max_seq_len, head_dim),
+                    dtype=ref_cache.key_cache[layer_idx].dtype,
+                    device=ref_cache.key_cache[layer_idx].device,
+                )
+                value_tensor = torch.zeros_like(key_tensor)
 
-        #         for i in range(batch_size):
-        #             if split_caches[i] is None:
-        #                 continue  # Skip samples without KV cache (zero)
-        #             # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
-        #             mask = attention_mask[i] == 1
-        #             key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
-        #             value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
-        #         inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
+                for i in range(batch_size):
+                    if split_caches[i] is None:
+                        continue  # Skip samples without KV cache (zero)
+                    # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
+                    mask = attention_mask[i] == 1
+                    key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
+                    value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
+                inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
 
         return prepare_inputs(inputs, device=device)
     
@@ -165,14 +168,26 @@ class IterationBin:
             model.eval()
             with torch.no_grad():
                 # if inputs["past_key_values"] is not None:
-                #     print(f"Model input cache size: {inputs['past_key_values'].key_cache[0].shape}")
-                outputs = model(
-                    input_ids=inputs["context_input_ids"],
-                    attention_mask=inputs["context_attention_mask"],
-                    past_key_values=inputs["past_key_values"],
-                    use_cache=True,
-                    return_dict=True,
-                )  # <loss, logits, past_key_values, hidden_states, attentions>
+                #     print(f"Model input cache size: {inputs['past_key_values'].key_cache[0].shape}, id size {inputs['context_input_ids'].shape}")
+                if workload == "prefill":
+                    # Pre-fill the model with the context
+                    outputs = model(
+                        input_ids=inputs["context_input_ids"],
+                        attention_mask=inputs["context_attention_mask"],
+                        past_key_values=inputs["past_key_values"],
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                elif workload == "decode":
+                    next_input_ids = inputs["context_input_ids"][:, -1:]        # 👈 Only next token(s)!
+                    next_attention_mask = inputs["context_attention_mask"][:, -1:]
+                    outputs = model(
+                        input_ids=next_input_ids,
+                        attention_mask=next_attention_mask,
+                        past_key_values=inputs["past_key_values"],
+                        use_cache=True,
+                        return_dict=True,
+                    )  # <loss, logits, past_key_values, hidden_states, attentions>
 
             # if inputs["past_key_values"] is not None:
             #     pdb.set_trace()
@@ -313,12 +328,13 @@ if __name__ == "__main__":
     iteration = 0
     tokens = 0
     while task_queue.qsize() > 0:
-        print(f"  **  Iteration {iteration} (current Q {task_queue.queue})  **  ")
+        print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
         while task_queue.qsize() > 0:
             _, taskID = task_queue.get(timeout=0.5)
             bin.add_task(preloaded_tasks[taskID])
-
-        bin.execute(bin.test_batch, model, workload='test', task_queue=task_queue)
+        print(f"\t\tPrefill {[task.taskID for task in bin.prefill_batch]}, Decode {[task.taskID for task in bin.decode_batch]}, Train {[task.taskID for task in bin.train_batch]}")
+        bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue)
+        bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue)
         bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue)
         iteration += 1
         tokens += task_queue.qsize()
