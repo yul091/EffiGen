@@ -10,17 +10,18 @@ from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM,
     LlamaTokenizer,
+    LlamaForCausalLM,
     LogitsProcessorList, 
     MinLengthLogitsProcessor,
 )
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, Cache
 from peft import get_peft_model, LoraConfig
 from queue import PriorityQueue
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task
 from alignment_study import DPOCollator, dpo_loss
-from utils import prepare_inputs
+from utils import prepare_inputs, save_metrics_with_order
 
 
 class IterationBin:
@@ -28,14 +29,22 @@ class IterationBin:
     def __init__(
         self,
         tokenizer: LlamaTokenizer,
+        inference_input_feature: str = "input_ids",
+        inference_mask_feature: str = "attention_mask",
         batch_collator: Optional[DPOCollator] = None,
     ):
-        # self.test_batch: List[Task] = []
+        self.inference_input_feature = inference_input_feature
+        self.inference_mask_feature = inference_mask_feature
         self.prefill_batch: List[Task] = []
         self.decode_batch: List[Task] = []
         self.train_batch: List[Task] = []
         self.tokenizer = tokenizer
-        self.batch_collator = batch_collator if batch_collator is not None else DPOCollator(tokenizer)
+        self.batch_collator = batch_collator if batch_collator is not None else \
+            DPOCollator(
+                tokenizer, 
+                inference_input_feature=inference_input_feature, 
+                inference_mask_feature=inference_mask_feature,
+            )
         
 
     def add_task(self, task: Task):
@@ -59,16 +68,16 @@ class IterationBin:
             return None
         inputs = [task.input_kwargs for task in batch]
         inputs = self.batch_collator(inputs)
-        
         inputs["past_key_values"] = None
-        # TO-DO: pad key values with varient sequence lengths
+
+        # For inference-only: pad key values with varient sequence lengths
         split_caches = [task.past_key_values for task in batch]
         if all(c is None for c in split_caches):  # Handle case where all caches are None
             return prepare_inputs(inputs, device=device)
        
         ref_cache = next(c for c in split_caches if c is not None)
         if ref_cache is not None:
-            attention_mask = inputs["context_attention_mask"][:, :-1]  # Remove the newly decoded token
+            attention_mask = inputs[self.inference_mask_feature][:, :-1]  # Remove the newly decoded token
             batch_size, max_seq_len = attention_mask.shape
             num_heads, _, head_dim  = ref_cache.key_cache[0].shape
             inputs["past_key_values"] = DynamicCache()
@@ -115,7 +124,6 @@ class IterationBin:
         # Update unfinished sequences
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(self.tokenizer.eos_token_id).long())
         # stoppings = stopping_criteria(input_ids, next_tokens_scores)
-        # print(f"Model output cache size: {output_cache.key_cache[0].shape}")
     
         # Update task status
         for i, task in enumerate(batch):
@@ -139,19 +147,19 @@ class IterationBin:
                 task_queue.put((task.get_priority(initial=False), task.taskID))
             else:  # stop decoding
                 # Update response (text) with next token
-                task.get_response(task.input_kwargs["context_input_ids"], self.tokenizer)
-                print(f"[Task {task.taskID} ({task.workload})] Response: {task.response}")
+                task.get_response(self.tokenizer)
                 
 
 
     def execute(
         self,
         batch: List[Task],
-        model: AutoModelForCausalLM,
+        model: LlamaForCausalLM,
         workload: str,
         task_queue: PriorityQueue,
         optimizer: Optional[torch.optim.Optimizer] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
+        generation_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not batch:
             return 
@@ -161,45 +169,55 @@ class IterationBin:
             model.train()
             optimizer = optimizer if optimizer is not None else torch.optim.Adam(model.parameters(), lr=5e-5)
             optimizer.zero_grad()
-            loss = dpo_loss(model, inputs)
-            loss.backward()
+            losses = dpo_loss(model, inputs, return_average=False)
+            losses.mean().backward()
             optimizer.step()
+            # Update task status
+            for i, task in enumerate(batch):
+                task.metrics["loss"] = losses[i].item()
         else:
             model.eval()
+            generation_config, model_kwargs = model._prepare_generation_config(generation_config, **inputs)
             with torch.no_grad():
-                # if inputs["past_key_values"] is not None:
-                #     print(f"Model input cache size: {inputs['past_key_values'].key_cache[0].shape}, id size {inputs['context_input_ids'].shape}")
+                model_kwargs = model._get_initial_cache_position(model_kwargs[self.inference_input_feature], model_kwargs)
+                # Handle decoding forward pass
+                model_forward = model.__call__
+                if isinstance(model_kwargs.get("past_key_values"), Cache):
+                    is_compileable = model_kwargs["past_key_values"].is_compileable and model._supports_static_cache
+                    is_compileable = is_compileable and not model.generation_config.disable_compile
+                    if is_compileable and (
+                        model.device.type == "cuda" or generation_config.compile_config._compile_all_devices
+                    ):
+                        os.environ["TOKENIZERS_PARALLELISM"] = "0"
+                        model_forward = model.get_compiled_call(generation_config.compile_config)
+                # Slicing the inputs based on cache positions
+                model_inputs = model.prepare_inputs_for_generation(**model_kwargs)
+                # Forward pass
                 if workload == "prefill":
-                    # Pre-fill the model with the context
                     outputs = model(
-                        input_ids=inputs["context_input_ids"],
-                        attention_mask=inputs["context_attention_mask"],
-                        past_key_values=inputs["past_key_values"],
-                        use_cache=True,
+                        **model_inputs,
+                        return_dict=True,
+                    )  # [loss, logits, past_key_values, hidden_states, attentions]
+                else:
+                    outputs = model_forward(
+                        **model_inputs,
                         return_dict=True,
                     )
-                elif workload == "decode":
-                    next_input_ids = inputs["context_input_ids"][:, -1:]        # 👈 Only next token(s)!
-                    next_attention_mask = inputs["context_attention_mask"][:, -1:]
-                    outputs = model(
-                        input_ids=next_input_ids,
-                        attention_mask=next_attention_mask,
-                        past_key_values=inputs["past_key_values"],
-                        use_cache=True,
-                        return_dict=True,
-                    )  # <loss, logits, past_key_values, hidden_states, attentions>
 
-            # if inputs["past_key_values"] is not None:
-            #     pdb.set_trace()
+            # # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
+            # inputs = model._update_model_kwargs_for_generation(
+            #     outputs,
+            #     inputs,
+            #     is_encoder_decoder=model.config.is_encoder_decoder,
+            # )
             logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
                 [MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=model.device),]
             )
-
             # Decode the next tokens and update task status
             self._batch_decoding(
                 batch=batch,
-                input_ids=inputs["context_input_ids"],
-                attention_mask=inputs["context_attention_mask"],
+                input_ids=model_kwargs[self.inference_input_feature],
+                attention_mask=model_kwargs[self.inference_mask_feature],
                 lm_logits=outputs.logits,
                 task_queue=task_queue,
                 logits_processor=logits_processor,
@@ -305,7 +323,7 @@ if __name__ == "__main__":
         )
         preloaded_tasks.append(task)
         
-    accum = i
+    accum = i+1
     for j, train_example in enumerate(processed_train_dataset):
         task = Task(
             taskID=accum+j,
@@ -332,7 +350,7 @@ if __name__ == "__main__":
         while task_queue.qsize() > 0:
             _, taskID = task_queue.get(timeout=0.5)
             bin.add_task(preloaded_tasks[taskID])
-        print(f"\t\tPrefill {[task.taskID for task in bin.prefill_batch]}, Decode {[task.taskID for task in bin.decode_batch]}, Train {[task.taskID for task in bin.train_batch]}")
+        # print(f"\t\tPrefill {[task.taskID for task in bin.prefill_batch]}, Decode {[task.taskID for task in bin.decode_batch]}, Train {[task.taskID for task in bin.train_batch]}")
         bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue)
         bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue)
         bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue)
@@ -341,3 +359,27 @@ if __name__ == "__main__":
     end = time.time()
 
     print(f"All tasks are completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
+
+    # Save the task's prompt and response to a file
+    output_dir = "profile_main/dummy/Mistral-7B-Instruct-v0.2"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "output_cache.json")
+    metrics = {
+        "iteration": iteration,
+        "total_time": end - start,
+        "throughput": tokens / (end - start),
+        "generation_results": [
+            {
+                "taskID": task.taskID,
+                "prompt": task.prompt,
+                "response": task.response,
+                "workload": task.workload,
+                "step": task.step,
+                # "rate_lambda": task.rate_lambda,
+                "metrics": task.metrics,
+            }
+            for task in preloaded_tasks
+        ],
+    }
+    save_metrics_with_order(metrics, output_file)
+    print(f"Metrics saved to {output_file}")

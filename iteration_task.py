@@ -48,14 +48,13 @@ class Task:
         self.prompt = prompt
         # Changable attributes
         self.input_kwargs = input_kwargs if input_kwargs is not None else {}
-        # self.past_key_values = past_key_values if past_key_values is not None else DynamicCache()
+        self.prompt_length = len(self.input_kwargs.get(self.CONTEXT_FEATURE, []))
         self.past_key_values = past_key_values
         self.step = 0
         self.release_time = self.get_release_time()
-        self.response = None
         self.priority = self.get_priority(initial=True)
-        self.prompt_length = len(self.input_kwargs.get(self.CONTEXT_FEATURE, []))
-        self.next_token = None
+        self.response = ""
+        self.metrics = {}
 
 
     def get_release_time(self) -> float:
@@ -77,11 +76,10 @@ class Task:
 
     def get_response(
         self, 
-        output_tokens: List[int],
         tokenizer: GPT2Tokenizer, 
+        output_tokens: Optional[List[int]] = None,
     ) -> None:
-        # print(f"Output length: {len(output_tokens)}, context_length: {self.prompt_length}")
-        assert len(output_tokens) >= self.prompt_length, "Output length is less than context length"
+        output_tokens = self.input_kwargs[self.CONTEXT_FEATURE] if output_tokens is None else output_tokens
         self.response = tokenizer.decode(output_tokens[self.prompt_length:], skip_special_tokens=True)
 
 

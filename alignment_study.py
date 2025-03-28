@@ -136,8 +136,10 @@ class DPOCollator:
     pad_to_multiple_of: Optional[int] = None
     label_pad_token_id: int = -100
     return_tensors: str = "pt"
+    inference_input_feature: str = "context_input_ids"
+    inference_mask_feature: str = "context_attention_mask"
 
-    def __call__(self, features: List[Dict[str, Any]], return_tensors=None):
+    def __call__(self, features: List[Dict[str, Any]], return_tensors=None, return_training_features=True):
         if return_tensors is None:
             return_tensors = self.return_tensors
 
@@ -157,79 +159,85 @@ class DPOCollator:
             return_tensors=return_tensors,
         )
 
-
-        # Pad `chosen_*` components
-        chosen_features = [
-            {
-                "input_ids": feature["chosen_input_ids"],
-                "attention_mask": feature["chosen_attention_mask"]
+        if not return_training_features:
+            # Return only context features
+            return {
+                self.inference_input_feature: padded_context["input_ids"],
+                self.inference_mask_feature: padded_context["attention_mask"],
             }
-            for feature in features
-        ]
-        padded_chosen = self.tokenizer.pad(
-            chosen_features,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=return_tensors,
-        )
-
-        # Pad `rejected_*` components
-        rejected_features = [
-            {
-                "input_ids": feature["rejected_input_ids"],
-                "attention_mask": feature["rejected_attention_mask"]
-            }
-            for feature in features
-        ]
-        padded_rejected = self.tokenizer.pad(
-            rejected_features,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=return_tensors,
-        )
-
-        # Process `chosen_labels` separately since tokenizer.pad() does not handle custom labels
-        chosen_labels = [feature["chosen_labels"] for feature in features]
-        max_label_length = max(len(l) for l in chosen_labels)
-
-        if self.pad_to_multiple_of is not None:
-            max_label_length = (
-                (max_label_length + self.pad_to_multiple_of - 1)
-                // self.pad_to_multiple_of
-                * self.pad_to_multiple_of
+        else:
+            # Pad `chosen_*` components
+            chosen_features = [
+                {
+                    "input_ids": feature["chosen_input_ids"],
+                    "attention_mask": feature["chosen_attention_mask"]
+                }
+                for feature in features
+            ]
+            padded_chosen = self.tokenizer.pad(
+                chosen_features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors=return_tensors,
             )
 
-        padding_side = self.tokenizer.padding_side
-        # Apply padding to labels, ensuring consistency with tokenizer's padding side
-        for feature in features:
-            remainder = [self.label_pad_token_id] * (max_label_length - len(feature["chosen_labels"]))
-            if isinstance(feature["chosen_labels"], list):
-                feature["chosen_labels"] = (
-                    feature["chosen_labels"] + remainder if padding_side == "right" else remainder + feature["chosen_labels"]
+            # Pad `rejected_*` components
+            rejected_features = [
+                {
+                    "input_ids": feature["rejected_input_ids"],
+                    "attention_mask": feature["rejected_attention_mask"]
+                }
+                for feature in features
+            ]
+            padded_rejected = self.tokenizer.pad(
+                rejected_features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors=return_tensors,
+            )
+
+            # Process `chosen_labels` separately since tokenizer.pad() does not handle custom labels
+            chosen_labels = [feature["chosen_labels"] for feature in features]
+            max_label_length = max(len(l) for l in chosen_labels)
+
+            if self.pad_to_multiple_of is not None:
+                max_label_length = (
+                    (max_label_length + self.pad_to_multiple_of - 1)
+                    // self.pad_to_multiple_of
+                    * self.pad_to_multiple_of
                 )
-            else:
-                feature["chosen_labels"] = np.concatenate(
-                    [feature["chosen_labels"], remainder] if padding_side == "right" else [remainder, feature["chosen_labels"]]
-                ).astype(np.int64)
 
-        # Convert `chosen_labels` to tensor
-        padded_chosen_labels = torch.tensor([feature["chosen_labels"] for feature in features])
+            padding_side = self.tokenizer.padding_side
+            # Apply padding to labels, ensuring consistency with tokenizer's padding side
+            for feature in features:
+                remainder = [self.label_pad_token_id] * (max_label_length - len(feature["chosen_labels"]))
+                if isinstance(feature["chosen_labels"], list):
+                    feature["chosen_labels"] = (
+                        feature["chosen_labels"] + remainder if padding_side == "right" else remainder + feature["chosen_labels"]
+                    )
+                else:
+                    feature["chosen_labels"] = np.concatenate(
+                        [feature["chosen_labels"], remainder] if padding_side == "right" else [remainder, feature["chosen_labels"]]
+                    ).astype(np.int64)
 
-        # Ensure padding tokens in labels are set to `-100`
-        padded_chosen_labels[padded_chosen_labels == self.tokenizer.pad_token_id] = -100
-    
-        # Construct final batch
-        batch = {
-            "context_input_ids": padded_context["input_ids"],
-            "context_attention_mask": padded_context["attention_mask"],
-            "chosen_input_ids": padded_chosen["input_ids"],
-            "chosen_attention_mask": padded_chosen["attention_mask"],
-            "chosen_labels": padded_chosen_labels,
-            "rejected_input_ids": padded_rejected["input_ids"],
-            "rejected_attention_mask": padded_rejected["attention_mask"],
-        }
+            # Convert `chosen_labels` to tensor
+            padded_chosen_labels = torch.tensor([feature["chosen_labels"] for feature in features])
+
+            # Ensure padding tokens in labels are set to `-100`
+            padded_chosen_labels[padded_chosen_labels == self.tokenizer.pad_token_id] = -100
+        
+            # Construct final batch
+            batch = {
+                self.inference_input_feature: padded_context["input_ids"],
+                self.inference_mask_feature: padded_context["attention_mask"],
+                "chosen_input_ids": padded_chosen["input_ids"],
+                "chosen_attention_mask": padded_chosen["attention_mask"],
+                "chosen_labels": padded_chosen_labels,
+                "rejected_input_ids": padded_rejected["input_ids"],
+                "rejected_attention_mask": padded_rejected["attention_mask"],
+            }
 
         return batch
 
@@ -397,7 +405,7 @@ def compute_metrics(model, dataloader, device):
 
 
 # === DPO Loss Function ===
-def dpo_loss(model, batch, beta=0.1):
+def dpo_loss(model, batch, beta=0.1, return_average=True):
     """Computes DPO contrastive loss from logits"""
     chosen_logits = model(input_ids=batch["chosen_input_ids"], attention_mask=batch["chosen_attention_mask"]).logits
     rejected_logits = model(input_ids=batch["rejected_input_ids"], attention_mask=batch["rejected_attention_mask"]).logits
@@ -407,7 +415,10 @@ def dpo_loss(model, batch, beta=0.1):
     rejected_logps = F.log_softmax(rejected_logits[:, -1, :], dim=-1)  # Last token log-probs, shape: (batch_size, vocab_size)
 
     # Contrastive objective: prefer chosen
-    loss = -F.logsigmoid(beta * (chosen_logps - rejected_logps)).mean()
+    if return_average:
+        loss = -F.logsigmoid(beta * (chosen_logps - rejected_logps)).mean()
+    else:
+        loss = -F.logsigmoid(beta * (chosen_logps - rejected_logps)).mean(dim=1)  # shape: (batch_size,)
     return loss
 
 
