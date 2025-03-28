@@ -4,14 +4,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Must be before torch is imported
 import time
 from typing import List, Optional, Dict, Any, Callable, Tuple, Union
 import torch
+import pdb
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM,
     LlamaTokenizer,
     LogitsProcessorList, 
-    StoppingCriteriaList, 
-    MaxLengthCriteria, 
     MinLengthLogitsProcessor,
 )
 from transformers.cache_utils import DynamicCache
@@ -31,22 +30,21 @@ class IterationBin:
         tokenizer: LlamaTokenizer,
         batch_collator: Optional[DPOCollator] = None,
     ):
-        self.prefill_batch: List[Task] = []
-        self.decode_batch: List[Task] = []
+        self.test_batch: List[Task] = []
         self.train_batch: List[Task] = []
         self.tokenizer = tokenizer
         self.batch_collator = batch_collator if batch_collator is not None else DPOCollator(tokenizer)
         
 
     def add_task(self, task: Task):
-        if task.workload == "prefill":
-            self.prefill_batch.append(task)
-        elif task.workload == "decode":
-            self.decode_batch.append(task)
-        elif task.workload == "train":
+        # if task.workload == "prefill":
+        #     self.prefill_batch.append(task)
+        # elif task.workload == "decode":
+        #     self.decode_batch.append(task)
+        if task.workload == "train":
             self.train_batch.append(task)
         else:
-            raise ValueError(f"Invalid workload: {task.workload}")
+            self.test_batch.append(task)
         
 
     def _create_batch(
@@ -56,23 +54,56 @@ class IterationBin:
     ):  
         if not batch:
             return None
-        input_kwargs = [task.input_kwargs for task in batch]
-        input_kwargs = self.batch_collator(input_kwargs)
-        # TO-DO: pad key values with varient sequence lengths
-        input_kwargs["past_key_values"] = None
-        return prepare_inputs(input_kwargs, device=device)
+        inputs = [task.input_kwargs for task in batch]
+        inputs = self.batch_collator(inputs)
+        
+        inputs["past_key_values"] = None
+        # # TO-DO: pad key values with varient sequence lengths
+        # split_caches = [task.past_key_values for task in batch]
+        # if all(c is None for c in split_caches):  # Handle case where all caches are None
+        #     return prepare_inputs(inputs, device=device)
+       
+        # ref_cache = next(c for c in split_caches if c is not None)
+        # if ref_cache is not None:
+        #     attention_mask = inputs["context_attention_mask"][:, :-1]  # Remove the newly decoded token
+        #     batch_size, max_seq_len = attention_mask.shape
+        #     num_heads, _, head_dim  = ref_cache.key_cache[0].shape
+        #     inputs["past_key_values"] = DynamicCache()
+
+        #     for layer_idx in range(len(ref_cache.key_cache)):
+        #         key_tensor = torch.zeros(
+        #             (batch_size, num_heads, max_seq_len, head_dim),
+        #             dtype=ref_cache.key_cache[layer_idx].dtype,
+        #             device=ref_cache.key_cache[layer_idx].device,
+        #         )
+        #         value_tensor = torch.zeros_like(key_tensor)
+
+        #         for i in range(batch_size):
+        #             if split_caches[i] is None:
+        #                 continue  # Skip samples without KV cache (zero)
+        #             # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
+        #             mask = attention_mask[i] == 1
+        #             key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
+        #             value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
+        #         inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
+
+        return prepare_inputs(inputs, device=device)
     
 
     def _batch_decoding(
         self,
+        batch: List[Task],
         input_ids: torch.Tensor,
-        outputs: Union[Tuple[Any], Dict[str, Any]],
+        attention_mask: torch.Tensor,
+        lm_logits: torch.Tensor,
+        task_queue: PriorityQueue,
         logits_processor: Callable,
-        stopping_criteria: Callable,
+        max_length: Optional[int] = None,
+        output_cache: Optional[DynamicCache] = None,
     ):
+        max_length = max_length if max_length is not None else 1024
         # Finished sentences should have their next token be a padding token
-        lm_logits = outputs.logits
-        batch_size = lm_logits.shape[0]
+        batch_size = lm_logits.shape[0]  # shape: [B, S, V]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
         next_token_logits = lm_logits[:, -1, :]  # B X V
         # Pre-process distribution
@@ -80,33 +111,16 @@ class IterationBin:
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)  # Greedy decoding (B)
         # Update unfinished sequences
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(self.tokenizer.eos_token_id).long())
-        return next_tokens, unfinished_sequences, stopping_criteria(input_ids, next_tokens_scores)
-    
-
-    def _update(
-        self,
-        batch: List[Task],
-        next_tokens: torch.Tensor,
-        task_queue: PriorityQueue,
-        unfinished_sequences: torch.Tensor,
-        stoppings: torch.BoolTensor,
-        attention_mask: torch.Tensor,
-        output_cache: Optional[DynamicCache] = None,
-    ):
-        # Update
+        # stoppings = stopping_criteria(input_ids, next_tokens_scores)
         # print(f"Model output cache size: {output_cache.key_cache[0].shape}")
+    
+        # Update task status
         for i, task in enumerate(batch):
-            # if unfinished_sequences[i] == 1 and stoppings[i] == 0:  # continue decoding
-            if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
-                task.update_status(workload="decode")
-                task.input_kwargs["context_input_ids"].append(next_tokens[i].item())
-                task.input_kwargs["context_attention_mask"].append(1)
-                task.step += 1
-                # Update response (text) with next token
-                task.response += self.tokenizer.decode(next_tokens[i].item())
-                # print(f"[Task {task.taskID} ({task.workload})] \nprompt: {task.prompt} \nresponse: {task.response}")
-                # Update past key values (cache)
-                if output_cache is None:  # [batch_size, num_heads, seq_len, head_dim]
+            task.update_decoding(next_tokens[i].item())
+            # if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
+            if unfinished_sequences[i] == 1 and task.step < max_length: # continue decoding
+                # Update past key values [batch_size, num_heads, seq_len, head_dim]
+                if output_cache is None:  
                     continue
                 # Split and update individual task's KV cache
                 mask = attention_mask[i] == 1
@@ -117,9 +131,14 @@ class IterationBin:
                         output_cache.value_cache[layer_idx][i, :, mask, :],
                         layer_idx=layer_idx,
                     )
-                print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
+                # print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
                 # Add task back to queue
                 task_queue.put((task.get_priority(initial=False), task.taskID))
+            else:  # stop decoding
+                # Update response (text) with next token
+                task.get_response(task.input_kwargs["context_input_ids"], self.tokenizer)
+                print(f"[Task {task.taskID} ({task.workload})] Response: {task.response}")
+                
 
 
     def execute(
@@ -128,72 +147,53 @@ class IterationBin:
         model: AutoModelForCausalLM,
         workload: str,
         task_queue: PriorityQueue,
-        max_length: Optional[int] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        
-    ):
+    ) -> None:
         if not batch:
-            return None
-        input_kwargs = self._create_batch(batch, device=model.device)
+            return 
+        
+        inputs = self._create_batch(batch, device=model.device)
         if workload == "train":
             model.train()
             optimizer = optimizer if optimizer is not None else torch.optim.Adam(model.parameters(), lr=5e-5)
             optimizer.zero_grad()
-            # outputs = model(**input_kwargs)
-            loss = dpo_loss(model, input_kwargs)
+            loss = dpo_loss(model, inputs)
             loss.backward()
             optimizer.step()
-
-            # Clear the batch
-            batch.clear()
-            return loss
-
         else:
             model.eval()
             with torch.no_grad():
+                # if inputs["past_key_values"] is not None:
+                #     print(f"Model input cache size: {inputs['past_key_values'].key_cache[0].shape}")
                 outputs = model(
-                    input_ids=input_kwargs["context_input_ids"],
-                    attention_mask=input_kwargs["context_attention_mask"],
-                    past_key_values=input_kwargs["past_key_values"],
+                    input_ids=inputs["context_input_ids"],
+                    attention_mask=inputs["context_attention_mask"],
+                    past_key_values=inputs["past_key_values"],
                     use_cache=True,
                     return_dict=True,
                 )  # <loss, logits, past_key_values, hidden_states, attentions>
 
-            max_length = max_length if max_length is not None else 128
+            # if inputs["past_key_values"] is not None:
+            #     pdb.set_trace()
             logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
                 [MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=model.device),]
             )
-            stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList(
-                [MaxLengthCriteria(max_length=max_length, max_position_embeddings=model.config.max_position_embeddings),]
-            )
 
-            next_tokens, unfinished_sequences, stoppings = self._batch_decoding(
-                input_ids=input_kwargs["context_input_ids"],
-                outputs=outputs,
-                logits_processor=logits_processor,
-                stopping_criteria=stopping_criteria,
-            )  # (B, ), (B, ), (B, )
-            # print(f"next tokens: {next_tokens}")
-            # print(f"unfinished sequences: {unfinished_sequences}")
-            # print(f"stoppings: {stoppings}")
-
-            # Update task status
-            self._update(
+            # Decode the next tokens and update task status
+            self._batch_decoding(
                 batch=batch,
-                next_tokens=next_tokens,
-                unfinished_sequences=unfinished_sequences,
+                input_ids=inputs["context_input_ids"],
+                attention_mask=inputs["context_attention_mask"],
+                lm_logits=outputs.logits,
                 task_queue=task_queue,
-                stoppings=stoppings,
-                attention_mask=input_kwargs["context_attention_mask"],
+                logits_processor=logits_processor,
                 output_cache=outputs.past_key_values,
-            )
-                
-            # Clear the batch
-            batch.clear()
+            ) 
 
-        return outputs
+        # Clear the batch
+        batch.clear()
+
     
 
 # Define batch tokenization
@@ -305,22 +305,23 @@ if __name__ == "__main__":
     task_queue = PriorityQueue()
     for taskID, task in enumerate(preloaded_tasks):
         task_queue.put((task.get_priority(initial=True), taskID))
-    print(f"task queue size: {task_queue.qsize()}")
+    # print(f"task queue size: {task_queue.qsize()}")
 
     # Create iteration bin and execute tasks
+    start = time.time()
     bin = IterationBin(tokenizer)
-    # print(f"prefill batch: {bin.prefill_batch}")
-    for iteration in range(5):
-        print(f"  **  Iteration {iteration}  **  ")
+    iteration = 0
+    tokens = 0
+    while task_queue.qsize() > 0:
+        print(f"  **  Iteration {iteration} (current Q {task_queue.queue})  **  ")
         while task_queue.qsize() > 0:
             _, taskID = task_queue.get(timeout=0.5)
             bin.add_task(preloaded_tasks[taskID])
 
-        # print(f"prefill batch: {bin.prefill_batch}")
-        outputs = bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue)
-        print(f"execution results (prefill): {outputs.keys() if outputs else None}")
-        outputs = bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue)
-        print(f"execution results (decode): {outputs.keys() if outputs else None}")
-        # print(f"decode batch: {bin.decode_batch}")
-        # print(f"train batch: {bin.train_batch}")
-        print(f"execution results (train): {bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue)})")
+        bin.execute(bin.test_batch, model, workload='test', task_queue=task_queue)
+        bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue)
+        iteration += 1
+        tokens += task_queue.qsize()
+    end = time.time()
+
+    print(f"All tasks are completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
