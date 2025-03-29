@@ -302,70 +302,105 @@ class DPOCollator:
 #     return accuracy, avg_clpd, avg_ppl
 
 
-# def compute_batch_loss(
-#     logits: torch.Tensor,
-#     labels: torch.Tensor,
-# ) -> torch.Tensor:
-#     """We hope to compute loss for each sample in the batch. Set  in CrossEntropyLoss."""
-#     loss = None
-#     if labels is not None:
-#         # Shift so that tokens < n predict n
-#         shift_logits = logits[..., :-1, :].contiguous()
-#         shift_labels = labels[..., 1:].contiguous()
-#         # Flatten the tokens
-#         loss_fct = CrossEntropyLoss(reduction="none")
-#         loss = loss_fct(
-#             shift_logits.view(-1, shift_logits.size(-1)), 
-#             shift_labels.view(-1),
-#         )  # shape: (batch_size * (seq_length - 1))
-#         # Reshape to (batch_size, seq_length - 1)
-#         per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
-#         # Compute token-wise mean loss per sequence (batch_size,)
-#         loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
-#         per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
-#     return per_sample_loss
+def compute_batch_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """We hope to compute loss for each sample in the batch. Set in CrossEntropyLoss."""
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss(reduction="none")
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), 
+            shift_labels.view(-1),
+        )  # shape: (batch_size * (seq_length - 1))
+        # Reshape to (batch_size, seq_length - 1)
+        per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
+        # Compute token-wise mean loss per sequence (batch_size,)
+        loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
+        per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
+    return per_sample_loss
 
 
-def compute_batch_metrics(model, batch, device):
-    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
+@torch.no_grad()
+def compute_batch_metrics(
+    model: AutoModelForCausalLM, 
+    batch: Dict[str, torch.Tensor],
+    chosen_input_feature: str = "chosen_input_ids",
+    chosen_mask_feature: str = "chosen_attention_mask",
+    chosen_labels_feature: str = "chosen_labels",
+    rejected_input_feature: str = "rejected_input_ids",
+    rejected_mask_feature: str = "rejected_attention_mask",
+    compute_average: bool = True,
+) -> Dict[str, Union[float, torch.Tensor]]:
     # Forward pass (one pass for chosen with labels)
-    with torch.no_grad():
+    if compute_average:
         outputs = model(
-            input_ids=batch["chosen_input_ids"],
-            attention_mask=batch["chosen_attention_mask"],
-            labels=batch["chosen_labels"],
+            input_ids=batch[chosen_input_feature],
+            attention_mask=batch[chosen_mask_feature],
+            labels=batch[chosen_labels_feature],
         )
-    # chosen_loss = compute_batch_loss(outputs.logits, batch["chosen_labels"])
-    # total_loss += chosen_loss.sum().item()
-    chosen_loss = outputs.loss
+        chosen_loss = outputs.loss
+        # Compute perplexity (exp(loss))
+        chosen_ppl = torch.exp(chosen_loss)
+        # For Preference Accuracy & CLPD
+        chosen_logits = outputs.logits[:, -1, :]
+        rejected_logits = model(
+            input_ids=batch[rejected_input_feature],
+            attention_mask=batch[rejected_mask_feature],
+        ).logits[:, -1, :]
 
-    # Compute perplexity (exp(loss))
-    chosen_ppl = torch.exp(chosen_loss)
-    # chosen_ppl = torch.exp(chosen_loss).sum().item()
+        # Compute Preference Accuracy (Win Rate)
+        chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
+        rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
+        correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1)).sum()
 
-    # For Preference Accuracy & CLPD
-    chosen_logits = outputs.logits[:, -1, :]
-    rejected_logits = model(
-        input_ids=batch["rejected_input_ids"],
-        attention_mask=batch["rejected_attention_mask"],
-    ).logits[:, -1, :]
+        # Compute Contrastive Log Probability Difference (CLPD)
+        log_prob_diff = (chosen_probs - rejected_probs).mean()
 
-    # Compute Preference Accuracy (Win Rate)
-    chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
-    rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
-    correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1)).sum()
+        return {
+            "loss": chosen_loss.item(),
+            "perplexity": chosen_ppl.item(),
+            "correct_preds": correct_preds.item(),
+            "batch_samples": chosen_probs.shape[0],
+            "log_prob_diff": log_prob_diff.item(),
+        }
+    
+    else:
+        outputs = model(
+            input_ids=batch[chosen_input_feature],
+            attention_mask=batch[chosen_mask_feature],
+        )
+        chosen_loss = compute_batch_loss(outputs.logits, batch[chosen_labels_feature])
+        chosen_ppl = torch.exp(chosen_loss)
+        # For Preference Accuracy & CLPD
+        chosen_logits = outputs.logits[:, -1, :]  # shape: (batch_size, vocab_size)
+        rejected_logits = model(
+            input_ids=batch[rejected_input_feature],
+            attention_mask=batch[rejected_mask_feature],
+        ).logits[:, -1, :]  # shape: (batch_size, vocab_size)
 
-    # Compute Contrastive Log Probability Difference (CLPD)
-    log_prob_diff = (chosen_probs - rejected_probs).mean()
+        # Compute Preference Accuracy (Win Rate)
+        chosen_probs = F.log_softmax(chosen_logits, dim=-1)  # shape: (batch_size, vocab_size)
+        rejected_probs = F.log_softmax(rejected_logits, dim=-1)  # shape: (batch_size, vocab_size)
+        correct_preds = (chosen_probs.mean(dim=-1) > rejected_probs.mean(dim=-1))  # shape: (batch_size,)
 
-    return {
-        "loss": chosen_loss.item(),
-        "perplexity": chosen_ppl.item(),
-        "correct_preds": correct_preds.item(),
-        "batch_samples": chosen_probs.shape[0],
-        "log_prob_diff": log_prob_diff.item(),
-    }
+        # Compute Contrastive Log Probability Difference (CLPD)
+        log_prob_diff = (chosen_probs - rejected_probs).mean(dim=-1)  # shape: (batch_size,)
+
+        return {
+            "loss": chosen_loss,
+            "perplexity": chosen_ppl,
+            "correct_preds": correct_preds,
+            # "batch_samples": chosen_probs.shape[0],
+            "log_prob_diff": log_prob_diff,
+        }
+
+    
 
 
 
@@ -379,7 +414,8 @@ def compute_metrics(model, dataloader, device):
 
     
     for batch in tqdm.tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
-        eval_outputs = compute_batch_metrics(model, batch, device)
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        eval_outputs = compute_batch_metrics(model, batch)
 
         total_loss += eval_outputs["loss"]
         total_perplexity += eval_outputs["perplexity"]

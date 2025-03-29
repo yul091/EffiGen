@@ -20,7 +20,7 @@ from queue import PriorityQueue
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task
-from alignment_study import DPOCollator, dpo_loss
+from alignment_study import DPOCollator, dpo_loss, compute_batch_metrics
 from utils import prepare_inputs, save_metrics_with_order
 
 
@@ -31,6 +31,7 @@ class IterationBin:
         tokenizer: LlamaTokenizer,
         inference_input_feature: str = "input_ids",
         inference_mask_feature: str = "attention_mask",
+        eval_metrics: bool = False,
         batch_collator: Optional[DPOCollator] = None,
     ):
         self.inference_input_feature = inference_input_feature
@@ -45,6 +46,7 @@ class IterationBin:
                 inference_input_feature=inference_input_feature, 
                 inference_mask_feature=inference_mask_feature,
             )
+        self.eval_metrics = eval_metrics
         
 
     def add_task(self, task: Task):
@@ -111,7 +113,7 @@ class IterationBin:
         task_queue: PriorityQueue,
         logits_processor: Callable,
         max_length: Optional[int] = None,
-        output_cache: Optional[DynamicCache] = None,
+        past_key_values: Optional[DynamicCache] = None,
     ):
         max_length = max_length if max_length is not None else 1024
         # Finished sentences should have their next token be a padding token
@@ -131,15 +133,15 @@ class IterationBin:
             # if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
             if unfinished_sequences[i] == 1 and task.step < max_length: # continue decoding
                 # Update past key values [batch_size, num_heads, seq_len, head_dim]
-                if output_cache is None:  
+                if past_key_values is None:  
                     continue
                 # Split and update individual task's KV cache
                 mask = attention_mask[i] == 1
                 task.past_key_values = DynamicCache()
-                for layer_idx in range(len(output_cache.key_cache)):
+                for layer_idx in range(len(past_key_values.key_cache)):
                     task.past_key_values.update(
-                        output_cache.key_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
-                        output_cache.value_cache[layer_idx][i, :, mask, :],
+                        past_key_values.key_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
+                        past_key_values.value_cache[layer_idx][i, :, mask, :],
                         layer_idx=layer_idx,
                     )
                 # print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
@@ -198,18 +200,19 @@ class IterationBin:
                         **model_inputs,
                         return_dict=True,
                     )  # [loss, logits, past_key_values, hidden_states, attentions]
+                    if self.eval_metrics:
+                        eval_outputs = compute_batch_metrics(model, inputs, compute_average=False)
+                        for i, task in enumerate(batch):
+                            for key, value in eval_outputs.items():
+                                # print(f"idx {i}, key {key}, value {value.shape}")
+                                task.metrics[key] = value[i].item()
+                            # task.metrics.update(eval_outputs)
                 else:
                     outputs = model_forward(
                         **model_inputs,
                         return_dict=True,
                     )
 
-            # # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
-            # inputs = model._update_model_kwargs_for_generation(
-            #     outputs,
-            #     inputs,
-            #     is_encoder_decoder=model.config.is_encoder_decoder,
-            # )
             logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
                 [MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=model.device),]
             )
@@ -221,7 +224,7 @@ class IterationBin:
                 lm_logits=outputs.logits,
                 task_queue=task_queue,
                 logits_processor=logits_processor,
-                output_cache=outputs.past_key_values,
+                past_key_values=outputs.past_key_values,
             ) 
 
         # Clear the batch
@@ -342,7 +345,7 @@ if __name__ == "__main__":
 
     # Create iteration bin and execute tasks
     start = time.time()
-    bin = IterationBin(tokenizer)
+    bin = IterationBin(tokenizer, eval_metrics=True)
     iteration = 0
     tokens = 0
     while task_queue.qsize() > 0:
