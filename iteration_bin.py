@@ -2,6 +2,8 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Must be before torch is imported
 import time
+import sys 
+sys.dont_write_bytecode = True
 from typing import List, Optional, Dict, Any, Callable, Tuple, Union
 import torch
 import pdb
@@ -17,8 +19,8 @@ from transformers import (
 from transformers.cache_utils import DynamicCache, Cache
 from peft import get_peft_model, LoraConfig
 from queue import PriorityQueue
-import sys 
-sys.dont_write_bytecode = True
+from concurrent.futures import ThreadPoolExecutor
+# import multiprocessing as mp
 from iteration_task import Task
 from alignment_study import DPOCollator, dpo_loss, compute_batch_metrics
 from utils import prepare_inputs, save_metrics_with_order
@@ -230,6 +232,36 @@ class IterationBin:
         # Clear the batch
         batch.clear()
 
+
+    def concurrent_execute(
+        self,
+        model: LlamaForCausalLM,
+        task_queue: PriorityQueue,
+        strategy: str = "sync",
+        max_workers: int = 3,
+        **kwargs,
+    ):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            if strategy == "sync":
+                # Prioritize the training workload
+                if self.train_batch:
+                    self.execute(self.train_batch, model, "train", task_queue, **kwargs)
+                for workload, batch in [
+                    ("prefill", self.prefill_batch),
+                    ("decode", self.decode_batch),
+                ]:
+                    executor.submit(self.execute, batch, model, workload, task_queue, **kwargs)
+
+            elif strategy == "async":
+                for workload, batch in [
+                    ("train", self.train_batch),
+                    ("prefill", self.prefill_batch),
+                    ("decode", self.decode_batch),
+                ]:
+                    executor.submit(self.execute, batch, model, workload, task_queue, **kwargs)
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
+
     
 
 # Define batch tokenization
@@ -269,9 +301,13 @@ def tokenize_and_align_labels(examples):
     }
 
 
+
+
+
 if __name__ == "__main__":
     
     # Verify the number of available CUDA devices
+    strategy = "async"  # or "sync"
     model_path = "mistralai/Mistral-7B-Instruct-v0.2"
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
@@ -299,7 +335,10 @@ if __name__ == "__main__":
     model.print_trainable_parameters()  # Should list LoRA parameters as trainable
     max_length = model.config.max_position_embeddings
     model.generation_config.pad_token_id = tokenizer.pad_token_id
+    # Get optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
+    # Load dataset 
     rlhf_data = load_dataset("data/Anthropic")
     test_dataset = rlhf_data["test"].select(range(5))
     train_dataset = rlhf_data["train"].select(range(5))
@@ -354,19 +393,26 @@ if __name__ == "__main__":
             _, taskID = task_queue.get(timeout=0.5)
             bin.add_task(preloaded_tasks[taskID])
         # print(f"\t\tPrefill {[task.taskID for task in bin.prefill_batch]}, Decode {[task.taskID for task in bin.decode_batch]}, Train {[task.taskID for task in bin.train_batch]}")
-        bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue)
-        bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue)
-        bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue)
+        # bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue, optimizer=optimizer)
+        # bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue, optimizer=optimizer)
+        # bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue, optimizer=optimizer)
+        bin.concurrent_execute(
+            model,
+            task_queue,
+            strategy=strategy,
+            max_workers=3,
+            optimizer=optimizer,
+        )
         iteration += 1
         tokens += task_queue.qsize()
     end = time.time()
 
-    print(f"All tasks are completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
+    print(f"Completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
 
     # Save the task's prompt and response to a file
     output_dir = "profile_main/dummy/Mistral-7B-Instruct-v0.2"
     os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "output_cache.json")
+    output_file = os.path.join(output_dir, f"output_cache_{strategy}.json")
     metrics = {
         "iteration": iteration,
         "total_time": end - start,
@@ -386,3 +432,5 @@ if __name__ == "__main__":
     }
     save_metrics_with_order(metrics, output_file)
     print(f"Metrics saved to {output_file}")
+
+    
