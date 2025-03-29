@@ -66,7 +66,7 @@ class Task:
         else:
             return self.base_priority[self.workload] + self.base_factor[self.workload] * (time.time() - self.release_time)
     
-    def update_decoding(self, next_token: int) -> None:
+    def update_decoding(self, next_token: int):
         self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode
         self.step += 1
         # Update the input_kwargs
@@ -78,7 +78,7 @@ class Task:
         self, 
         tokenizer: GPT2Tokenizer, 
         output_tokens: Optional[List[int]] = None,
-    ) -> None:
+    ):
         output_tokens = self.input_kwargs[self.CONTEXT_FEATURE] if output_tokens is None else output_tokens
         self.response = tokenizer.decode(output_tokens[self.prompt_length:], skip_special_tokens=True)
 

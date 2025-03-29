@@ -6,7 +6,7 @@ import sys
 sys.dont_write_bytecode = True
 from typing import List, Optional, Dict, Any, Callable, Tuple, Union
 import torch
-import pdb
+import torch.nn as nn
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer, 
@@ -30,24 +30,15 @@ class IterationBin:
 
     def __init__(
         self,
-        tokenizer: LlamaTokenizer,
         inference_input_feature: str = "input_ids",
         inference_mask_feature: str = "attention_mask",
         eval_metrics: bool = False,
-        batch_collator: Optional[DPOCollator] = None,
     ):
         self.inference_input_feature = inference_input_feature
         self.inference_mask_feature = inference_mask_feature
         self.prefill_batch: List[Task] = []
         self.decode_batch: List[Task] = []
         self.train_batch: List[Task] = []
-        self.tokenizer = tokenizer
-        self.batch_collator = batch_collator if batch_collator is not None else \
-            DPOCollator(
-                tokenizer, 
-                inference_input_feature=inference_input_feature, 
-                inference_mask_feature=inference_mask_feature,
-            )
         self.eval_metrics = eval_metrics
         
 
@@ -66,12 +57,19 @@ class IterationBin:
     def _create_batch(
         self,
         batch: List[Task],
+        batch_collator: Optional[DPOCollator] = None,
         device: Optional[str] = "cuda",
     ):  
         if not batch:
             return None
+        batch_collator = batch_collator if batch_collator is not None else \
+            DPOCollator(
+                tokenizer, 
+                inference_input_feature=self.inference_input_feature, 
+                inference_mask_feature=self.inference_mask_feature,
+            )
         inputs = [task.input_kwargs for task in batch]
-        inputs = self.batch_collator(inputs)
+        inputs = batch_collator(inputs)
         inputs["past_key_values"] = None
 
         # For inference-only: pad key values with varient sequence lengths
@@ -113,20 +111,30 @@ class IterationBin:
         attention_mask: torch.Tensor,
         lm_logits: torch.Tensor,
         task_queue: PriorityQueue,
-        logits_processor: Callable,
+        tokenizer: LlamaTokenizer,
+        do_sample: bool = False,
+        logits_processor: Optional[Callable] = None,
         max_length: Optional[int] = None,
         past_key_values: Optional[DynamicCache] = None,
     ):
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
+            [MinLengthLogitsProcessor(1, eos_token_id=tokenizer.eos_token_id, device=input_ids.device),]
+        )
         max_length = max_length if max_length is not None else 1024
         # Finished sentences should have their next token be a padding token
         batch_size = lm_logits.shape[0]  # shape: [B, S, V]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
         next_token_logits = lm_logits[:, -1, :]  # B X V
         # Pre-process distribution
-        next_tokens_scores = logits_processor(input_ids, next_token_logits)
-        next_tokens = torch.argmax(next_tokens_scores, dim=-1)  # Greedy decoding (B)
+        next_token_scores = logits_processor(input_ids, next_token_logits)
+        # Token selection
+        if do_sample:
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)  # Greedy decoding (B)
         # Update unfinished sequences
-        unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(self.tokenizer.eos_token_id).long())
+        unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(tokenizer.eos_token_id).long())
         # stoppings = stopping_criteria(input_ids, next_tokens_scores)
     
         # Update task status
@@ -151,7 +159,7 @@ class IterationBin:
                 task_queue.put((task.get_priority(initial=False), task.taskID))
             else:  # stop decoding
                 # Update response (text) with next token
-                task.get_response(self.tokenizer)
+                task.get_response(tokenizer)
                 
 
 
@@ -159,16 +167,19 @@ class IterationBin:
         self,
         batch: List[Task],
         model: LlamaForCausalLM,
+        tokenizer: LlamaTokenizer,
         workload: str,
         task_queue: PriorityQueue,
+        batch_collator: Optional[DPOCollator] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
+        max_length: Optional[int] = None,
         generation_config: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ):
         if not batch:
             return 
         
-        inputs = self._create_batch(batch, device=model.device)
+        inputs = self._create_batch(batch, batch_collator=batch_collator, device=model.device)
         if workload == "train":
             model.train()
             optimizer = optimizer if optimizer is not None else torch.optim.Adam(model.parameters(), lr=5e-5)
@@ -181,8 +192,8 @@ class IterationBin:
                 task.metrics["loss"] = losses[i].item()
         else:
             model.eval()
-            generation_config, model_kwargs = model._prepare_generation_config(generation_config, **inputs)
             with torch.no_grad():
+                generation_config, model_kwargs = model._prepare_generation_config(generation_config, **inputs)
                 model_kwargs = model._get_initial_cache_position(model_kwargs[self.inference_input_feature], model_kwargs)
                 # Handle decoding forward pass
                 model_forward = model.__call__
@@ -203,10 +214,9 @@ class IterationBin:
                         return_dict=True,
                     )  # [loss, logits, past_key_values, hidden_states, attentions]
                     if self.eval_metrics:
-                        eval_outputs = compute_batch_metrics(model, inputs, compute_average=False)
+                        eval_outputs = compute_batch_metrics(model, inputs, compute_average=False)  # return batch results
                         for i, task in enumerate(batch):
                             for key, value in eval_outputs.items():
-                                # print(f"idx {i}, key {key}, value {value.shape}")
                                 task.metrics[key] = value[i].item()
                             # task.metrics.update(eval_outputs)
                 else:
@@ -215,9 +225,6 @@ class IterationBin:
                         return_dict=True,
                     )
 
-            logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
-                [MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=model.device),]
-            )
             # Decode the next tokens and update task status
             self._batch_decoding(
                 batch=batch,
@@ -225,7 +232,10 @@ class IterationBin:
                 attention_mask=model_kwargs[self.inference_mask_feature],
                 lm_logits=outputs.logits,
                 task_queue=task_queue,
+                tokenizer=tokenizer,
+                do_sample=generation_config.do_sample,
                 logits_processor=logits_processor,
+                max_length=max_length,
                 past_key_values=outputs.past_key_values,
             ) 
 
@@ -236,6 +246,7 @@ class IterationBin:
     def concurrent_execute(
         self,
         model: LlamaForCausalLM,
+        tokenizer: LlamaTokenizer,
         task_queue: PriorityQueue,
         strategy: str = "sync",
         max_workers: int = 3,
@@ -245,12 +256,12 @@ class IterationBin:
             if strategy == "sync":
                 # Prioritize the training workload
                 if self.train_batch:
-                    self.execute(self.train_batch, model, "train", task_queue, **kwargs)
+                    self.execute(self.train_batch, model, tokenizer, "train", task_queue, **kwargs)
                 for workload, batch in [
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
-                    executor.submit(self.execute, batch, model, workload, task_queue, **kwargs)
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, **kwargs)
 
             elif strategy == "async":
                 for workload, batch in [
@@ -258,7 +269,7 @@ class IterationBin:
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
-                    executor.submit(self.execute, batch, model, workload, task_queue, **kwargs)
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, **kwargs)
             else:
                 raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
 
@@ -337,7 +348,13 @@ if __name__ == "__main__":
     model.generation_config.pad_token_id = tokenizer.pad_token_id
     # Get optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
+    # # Get batch collator
+    # batch_collator = DPOCollator(
+    #     tokenizer, 
+    #     inference_input_feature="input_ids", 
+    #     inference_mask_feature="attention_mask",
+    # )
+    
     # Load dataset 
     rlhf_data = load_dataset("data/Anthropic")
     test_dataset = rlhf_data["test"].select(range(5))
@@ -384,25 +401,19 @@ if __name__ == "__main__":
 
     # Create iteration bin and execute tasks
     start = time.time()
-    bin = IterationBin(tokenizer, eval_metrics=True)
+    bin = IterationBin(eval_metrics=True)
     iteration = 0
     tokens = 0
+    max_workers=3 if strategy == "async" else 2
     while task_queue.qsize() > 0:
         print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
         while task_queue.qsize() > 0:
             _, taskID = task_queue.get(timeout=0.5)
             bin.add_task(preloaded_tasks[taskID])
-        # print(f"\t\tPrefill {[task.taskID for task in bin.prefill_batch]}, Decode {[task.taskID for task in bin.decode_batch]}, Train {[task.taskID for task in bin.train_batch]}")
-        # bin.execute(bin.prefill_batch, model, workload='prefill', task_queue=task_queue, optimizer=optimizer)
-        # bin.execute(bin.decode_batch, model, workload='decode', task_queue=task_queue, optimizer=optimizer)
-        # bin.execute(bin.train_batch, model, workload='train', task_queue=task_queue, optimizer=optimizer)
-        bin.concurrent_execute(
-            model,
-            task_queue,
-            strategy=strategy,
-            max_workers=3,
-            optimizer=optimizer,
-        )
+        # bin.execute(bin.prefill_batch, model, tokenizer, workload='prefill', task_queue=task_queue, optimizer=optimizer)
+        # bin.execute(bin.decode_batch, model, tokenizer, workload='decode', task_queue=task_queue, optimizer=optimizer)
+        # bin.execute(bin.train_batch, model, tokenizer, workload='train', task_queue=task_queue, optimizer=optimizer)
+        bin.concurrent_execute(model, tokenizer, task_queue, strategy=strategy, max_workers=max_workers, optimizer=optimizer)
         iteration += 1
         tokens += task_queue.qsize()
     end = time.time()
