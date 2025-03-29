@@ -1,57 +1,72 @@
 # A definition of the Scheduler class and supported functions.
-from typing import List, Tuple
-import numpy as np
+from typing import List
+from queue import PriorityQueue
+from transformers import AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task  
+from iteration_bin import Bin
 
 
 class Scheduler:
-    def __init__(self, lambda1: float = 0.5, lambda2: float = 0.5, K: int = 3):
+    def __init__(self, lambda1: float = 0.5, lambda2: float = 0.5):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
-        self.K = K  # number of bins to search for best-fit
     
-    def look_ahead(self, task: Task) -> Tuple[float, float]:
-        """
-        Dummy memory & latency estimator (to be replaced with real profiler).
-        """
-        return task.memory_estimate, task.latency_estimate
+    # def look_ahead(self, task: Task) -> Tuple[float, float]:
+    #     """
+    #     Memory & latency estimator.
+    #     """
+    #     return task.get_workload()
 
-    def bin_allocator(self, task_queue: List[Task], bin_capacity: float) -> List[List[Task]]:
+    def best_fit_allocate(
+        self, 
+        task_queue: PriorityQueue, 
+        preloaded_tasks: List[Task], 
+        model: AutoModelForCausalLM,
+        **bin_kwargs,
+    ) -> Bin:
         """
         Priority-aware best-fit bin packing considering both memory & latency.
         """
-        bins: List[List[Task]] = []
+        bins: List[Bin] = []
 
-        # Sort by priority (higher priority goes first)
-        sorted_tasks = sorted(task_queue, key=lambda t: -t.priority)
+        while task_queue.qsize() > 0:
+            _, taskID = task_queue.get()
+            task: Task = preloaded_tasks[taskID]
+            best_bin, best_score = None, float('inf')
+            # Get task workload anticipation
+            memory, latency = task.get_workload(model, bin_kwargs.get("attn_implementation", "flash_attention_2"))
 
-        for task in sorted_tasks:
-            task_mem, task_lat = self.look_ahead(task)
-            best_bin_index = None
-            best_score = float("inf")
+            for bin in bins:
+                # Check if the bin can accommodate the task
+                if bin.free_memory >= memory:
+                    memory_fit = abs(bin.free_memory - memory)
+                    latency_fit = abs(bin.max_latency - latency)
+                    score = self.lambda1 * memory_fit + self.lambda2 * latency_fit
+                    if score < best_score:
+                        best_bin = bin
+                        best_score = score
 
-            # Search top-K best bins
-            for i in range(min(self.K, len(bins))):
-                current_bin = bins[i]
-                mem_used = sum(t.memory_estimate for t in current_bin)
-                lat_max = max((t.latency_estimate for t in current_bin), default=0)
+            if best_bin is not None:
+                best_bin.add_task(task)
+                best_bin.update_workload(operation="add", memory=memory, latency=latency)
+            else:  
+                # current bins are exhausted
+                new_bin = Bin(eval_metrics=bin_kwargs.get("eval_metrics", False))
+                new_bin.add_task(task)
+                new_bin.update_workload(operation="add", memory=memory, latency=latency)
+                bins.append(new_bin)
 
-                if mem_used + task_mem > bin_capacity:
-                    continue  # skip bin if memory exceeds
+        # Put the remaining tasks (from remaining bin (if exists)) back into the queue
+        # print(f"  **  Current bins {bins}  **  ")
+        if len(bins) > 1:
+            for i in range(1, len(bins)):
+                for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
+                    task_queue.put((task.get_priority(initial=False), task.taskID))
 
-                mem_fit = abs((bin_capacity - mem_used) - task_mem)
-                lat_fit = abs(lat_max - task_lat)
-                score = self.lambda1 * mem_fit + self.lambda2 * lat_fit
+        # Return the next bin for execution
+        return bins[0]  
 
-                if score < best_score:
-                    best_score = score
-                    best_bin_index = i
 
-            if best_bin_index is not None:
-                bins[best_bin_index].append(task)
-            else:
-                bins.append([task])  # new bin
 
-        return bins

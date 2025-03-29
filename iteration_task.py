@@ -1,21 +1,16 @@
 # A definition of the Task class and supported functions.
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import time
-from transformers import GPT2Tokenizer
+from transformers import LlamaTokenizer, LlamaForCausalLM
 from transformers.cache_utils import DynamicCache
 
 
 class Task:
 
-    base_priority = {
-        "prefill": 5,
-        "decode": 10,
-        "train": 1,
-    }
-    base_factor = {
-        "prefill": 5e-2,
-        "decode": 1e-2,
-        "train": 1e-1,
+    coefficients = {
+        "prefill": {"base_priority": 5, "priority_factor": 5e-2, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
+        "decode": {"base_priority": 10, "priority_factor": 1e-2, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
+        "train": {"base_priority": 1, "priority_factor": 1e-1, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
     }
 
     CONTEXT_FEATURE = "context_input_ids"
@@ -41,7 +36,7 @@ class Task:
         """
         # Fixed attributes
         self.taskID = taskID
-        if workload not in self.base_priority:
+        if workload not in self.coefficients:
             raise ValueError(f"Invalid workload: {workload}")
         self.workload = workload
         self.rate_lambda = rate_lambda
@@ -62,9 +57,9 @@ class Task:
     
     def get_priority(self, initial: bool = False) -> float:
         if initial:
-            return self.base_priority[self.workload]
+            return self.coefficients[self.workload]["base_priority"]
         else:
-            return self.base_priority[self.workload] + self.base_factor[self.workload] * (time.time() - self.release_time)
+            return self.coefficients[self.workload]["base_priority"] + self.coefficients[self.workload]["priority_factor"] * (time.time() - self.release_time)
     
     def update_decoding(self, next_token: int):
         self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode
@@ -73,14 +68,31 @@ class Task:
         self.input_kwargs[self.CONTEXT_FEATURE].append(next_token)
         self.input_kwargs[self.CONTEXT_MASK].append(1)
         
-
     def get_response(
         self, 
-        tokenizer: GPT2Tokenizer, 
+        tokenizer: LlamaTokenizer, 
         output_tokens: Optional[List[int]] = None,
     ):
         output_tokens = self.input_kwargs[self.CONTEXT_FEATURE] if output_tokens is None else output_tokens
         self.response = tokenizer.decode(output_tokens[self.prompt_length:], skip_special_tokens=True)
+
+    def get_workload(
+        self,
+        model: LlamaForCausalLM,
+        attn_implementation: str = "flash_attention_2",
+    ) -> Tuple[float, float]:
+        """
+        Estimate the workload based on the model and input.
+        This is a placeholder function and should be replaced with actual profiling logic.
+        """
+        basic_factor = model.model.config.num_hidden_layers * model.model.config.hidden_size  # num_layers * hidden_dim
+        length_multiplier = len(self.input_kwargs[self.CONTEXT_FEATURE]) \
+            if attn_implementation == "flash_attention_2" else len(self.input_kwargs[self.CONTEXT_FEATURE])**2
+        memory = basic_factor * length_multiplier * self.coefficients[self.workload]["memory_coeff"]
+        latency = basic_factor * length_multiplier * self.coefficients[self.workload]["latency_coeff"]
+        return memory, latency
+        
+        
 
 
 
