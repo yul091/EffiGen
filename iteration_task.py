@@ -46,7 +46,7 @@ class Task:
         self.prompt_length = len(self.input_kwargs.get(self.CONTEXT_FEATURE, []))
         self.past_key_values = past_key_values
         self.step = 0
-        self.release_time = self.get_release_time()
+        self.release_time = None
         self.priority = self.get_priority(initial=True)
         self.response = ""
         self.metrics = {}
@@ -57,6 +57,7 @@ class Task:
     
     def get_priority(self, initial: bool = False) -> float:
         if initial:
+            self.release_time = self.get_release_time()
             return self.coefficients[self.workload]["base_priority"]
         else:
             return self.coefficients[self.workload]["base_priority"] + self.coefficients[self.workload]["priority_factor"] * (time.time() - self.release_time)

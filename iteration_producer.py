@@ -1,0 +1,138 @@
+# A definition of the Producer class and supported functions.
+from typing import List, Dict, Any, Optional
+import time
+import random
+import logging
+from queue import PriorityQueue
+import sys 
+sys.dont_write_bytecode = True
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from iteration_task import Task  
+
+
+
+class Producer:
+
+    def __init__(
+        self,
+        arrival_rate: float,
+        retrain_rate: float,
+        arrival_pattern: Optional[str] = None,
+        n_test_samples: Optional[int] = None,
+    ):
+        self.arrival_rate = arrival_rate
+        self.retrain_rate = retrain_rate
+        self.arrival_pattern = arrival_pattern if arrival_pattern is not None else "poisson"
+        self.n_test_samples = n_test_samples if n_test_samples is not None else 100
+        self.n_train_samples = int(self.n_test_samples * retrain_rate)
+        
+
+    def load_dataset(
+        self, 
+        tokenizer: AutoTokenizer,
+        max_length: int,
+        dataset_name: str = "data/Anthropic",
+    ) -> List[Task]:
+        """
+        Load dataset and tokenize inputs. Create a preloaded dataset of Task objects.
+        """
+        
+        random.seed(42)
+        # Load dataset 
+        rlhf_data = load_dataset(dataset_name)
+        test_indices = random.sample(range(len(rlhf_data["test"])), self.n_test_samples)
+        test_dataset = rlhf_data["test"].select(test_indices)
+        train_indices = random.sample(range(len(rlhf_data["train"])), self.n_train_samples)
+        train_dataset = rlhf_data["train"].select(train_indices)
+
+        # Define batch tokenization
+        def tokenize_and_align_labels(examples):
+            """Tokenizes inputs in batch and masks out context for chosen labels."""
+            contexts = examples["context"]
+            chosens = examples["chosen_response"]
+            rejecteds = examples["rejected_response"]
+
+            # Tokenize all inputs in batch mode
+            chosen_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, chosens)],
+                                        truncation=True, padding=False,  # Use dynamic padding later during collation
+                                        max_length=max_length)
+            
+            rejected_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, rejecteds)],
+                                        truncation=True, padding=False,  # Use dynamic padding later during collation
+                                        max_length=max_length)
+
+            # Tokenize context separately (to get its length)
+            context_encodings = tokenizer(contexts, truncation=True, padding=False, max_length=max_length)
+            context_lengths = [len(enc) for enc in context_encodings["input_ids"]]
+
+            # Create labels: Mask out context tokens by setting them to `-100`
+            chosen_labels = [
+                [-100] * ctx_len + chosen_encodings["input_ids"][i][ctx_len:]
+                for i, ctx_len in enumerate(context_lengths)
+            ]
+
+            return {
+                "context_input_ids": context_encodings["input_ids"],
+                "context_attention_mask": context_encodings["attention_mask"],
+                "chosen_input_ids": chosen_encodings["input_ids"],
+                "chosen_attention_mask": chosen_encodings["attention_mask"],
+                "chosen_labels": chosen_labels,
+                "rejected_input_ids": rejected_encodings["input_ids"],
+                "rejected_attention_mask": rejected_encodings["attention_mask"],
+            }
+
+
+        processed_test_dataset = test_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            load_from_cache_file=False,
+        ).remove_columns(test_dataset.column_names)
+        processed_train_dataset = train_dataset.map(
+            tokenize_and_align_labels, 
+            batched=True, 
+            load_from_cache_file=False,
+        ).remove_columns(train_dataset.column_names)
+
+        # Preloaded tasks
+        preloaded_tasks: List[Task] = []
+        for i, test_example in enumerate(processed_test_dataset):
+            task = Task(
+                taskID=i,
+                workload="prefill", 
+                rate_lambda=self.arrival_rate, 
+                prompt=test_dataset[i]["context"],
+                input_kwargs=test_example,
+            )
+            preloaded_tasks.append(task)
+            
+        accum = len(processed_test_dataset)
+        for j, train_example in enumerate(processed_train_dataset):
+            task = Task(
+                taskID=accum+j,
+                workload="train", 
+                rate_lambda=self.arrival_rate, 
+                prompt=train_dataset[j]["context"],
+                input_kwargs=train_example,
+            )
+            preloaded_tasks.append(task)
+
+        # Shuffle the dataset
+        random.shuffle(preloaded_tasks)
+        print(f"Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({self.n_test_samples * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({self.n_train_samples * 100 / len(preloaded_tasks):.2f}%)")
+        return preloaded_tasks
+    
+
+
+    def produce(self, task_queue: PriorityQueue, preloaded_tasks: List[Task]):
+
+        # Produce using the dataset
+        for taskID, task in enumerate(preloaded_tasks):
+            print(f"  **  Producing task {taskID} ({task.workload})  **  ")
+            time.sleep(random.expovariate(task.rate_lambda))
+            # Essentially, we are using preloaded data (task ID)
+            task_queue.put((task.get_priority(initial=True), taskID))
+            
+        task_queue.put((float('inf'), None))  # Signal the end of the dataset
+        logging.info("Producer finished producing tasks")
+

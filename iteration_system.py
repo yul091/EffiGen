@@ -5,65 +5,27 @@ import time
 from queue import PriorityQueue
 import torch
 from peft import LoraConfig, get_peft_model
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task  
-# from iteration_bin import Bin
+from iteration_producer import Producer
 from iteration_scheduler import Scheduler
 from utils import save_metrics_with_order
 
 
 
-# Define batch tokenization
-def tokenize_and_align_labels(examples):
-    """Tokenizes inputs in batch and masks out context for chosen labels."""
-    contexts = examples["context"]
-    chosens = examples["chosen_response"]
-    rejecteds = examples["rejected_response"]
 
-    # Tokenize all inputs in batch mode
-    chosen_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, chosens)],
-                                 truncation=True, padding=False,  # Use dynamic padding later during collation
-                                 max_length=max_length)
-    
-    rejected_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, rejecteds)],
-                                   truncation=True, padding=False,  # Use dynamic padding later during collation
-                                   max_length=max_length)
-
-    # Tokenize context separately (to get its length)
-    context_encodings = tokenizer(contexts, truncation=True, padding=False, max_length=max_length)
-    context_lengths = [len(enc) for enc in context_encodings["input_ids"]]
-
-    # Create labels: Mask out context tokens by setting them to `-100`
-    chosen_labels = [
-        [-100] * ctx_len + chosen_encodings["input_ids"][i][ctx_len:]
-        for i, ctx_len in enumerate(context_lengths)
-    ]
-
-    return {
-        "context_input_ids": context_encodings["input_ids"],
-        "context_attention_mask": context_encodings["attention_mask"],
-        "chosen_input_ids": chosen_encodings["input_ids"],
-        "chosen_attention_mask": chosen_encodings["attention_mask"],
-        "chosen_labels": chosen_labels,
-        "rejected_input_ids": rejected_encodings["input_ids"],
-        "rejected_attention_mask": rejected_encodings["attention_mask"],
-    }
-
-
-
-if __name__ == "__main__":
-    import random 
-
-    random.seed(42)
+if __name__ == "__main__":    
     
     # Verify the number of available CUDA devices
     device = 1
     strategy = "async"  # or "sync"
     attn_implementation = "flash_attention_2"  # or "triton"
     model_path = "mistralai/Mistral-7B-Instruct-v0.2"
+    arrival_rate = 10
+    n_test_samples = 100
+    retrain_rate = 0.2
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -93,101 +55,74 @@ if __name__ == "__main__":
     # Get optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
     
-    # Load dataset 
-    rlhf_data = load_dataset("data/Anthropic")
-    test_indices = random.sample(range(len(rlhf_data["test"])), 25)
-    test_dataset = rlhf_data["test"].select(test_indices)
-    train_indices = random.sample(range(len(rlhf_data["train"])), 10)
-    train_dataset = rlhf_data["train"].select(train_indices)
-    processed_test_dataset = test_dataset.map(
-        tokenize_and_align_labels,
-        batched=True,
-        load_from_cache_file=False,
-    ).remove_columns(test_dataset.column_names)
-    processed_train_dataset = train_dataset.map(
-        tokenize_and_align_labels, 
-        batched=True, 
-        load_from_cache_file=False,
-    ).remove_columns(train_dataset.column_names)  
-  
-    # Preloaded tasks
-    preloaded_tasks: List[Task] = []
-    for i, test_example in enumerate(processed_test_dataset):
-        task = Task(
-            taskID=i,
-            workload="prefill", 
-            rate_lambda=10, 
-            prompt=test_dataset[i]["context"],
-            input_kwargs=test_example,
-        )
-        preloaded_tasks.append(task)
-        
-    accum = i+1
-    for j, train_example in enumerate(processed_train_dataset):
-        task = Task(
-            taskID=accum+j,
-            workload="train", 
-            rate_lambda=10, 
-            prompt=train_dataset[j]["context"],
-            input_kwargs=train_example,
-        )
-        preloaded_tasks.append(task)
-
-    # Simulate global scheduler
-    task_queue = PriorityQueue()
-    for taskID, task in enumerate(preloaded_tasks):
-        task_queue.put((task.get_priority(initial=True), taskID))
+    # Get producer (loading dataset and pushing tasks to queue)
+    producer = Producer(
+        arrival_rate=arrival_rate, 
+        retrain_rate=retrain_rate, 
+        arrival_pattern="poisson", 
+        n_test_samples=n_test_samples,
+    )
+    preloaded_tasks = producer.load_dataset(
+        tokenizer=tokenizer,
+        max_length=max_length,
+        dataset_name="data/Anthropic",
+    )
 
     # Create iteration bin and execute tasks
     start = time.time()
     # bin = Bin(eval_metrics=True)
-    scheduler = Scheduler(lambda1=0.5, lambda2=0.5)
-    max_workers=3 if strategy == "async" else 2
-    bin_kwargs = {
-        "attn_implementation": attn_implementation,
-        "max_workers": max_workers,
-        "max_length": 1024,
-        "strategy": strategy,
-        "optimizer": optimizer,
-        "eval_metrics": True,
-    }
-    iteration = 0
-    tokens = 0
-    while task_queue.qsize() > 0:
-        print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
-        tokens += task_queue.qsize()
-        # while task_queue.qsize() > 0:
-        #     _, taskID = task_queue.get(timeout=0.5)
-        #     bin.add_task(preloaded_tasks[taskID])
-        bin = scheduler.best_fit_allocate(task_queue, preloaded_tasks, model, **bin_kwargs)
-        print(f"\tBin allocation (prefill_batch {len(bin.prefill_batch)}, decode_batch {len(bin.decode_batch)}, train_batch {len(bin.train_batch)})")
-        bin.concurrent_execute(model, tokenizer, task_queue, **bin_kwargs)
-        iteration += 1
-        break
-        
+    task_queue = PriorityQueue()
+    # Produce tasks
+    producer.produce(task_queue, preloaded_tasks)
     end = time.time()
 
-    print(f"Completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
 
-    # Save the task's prompt and response to a file
-    output_dir = "profile_main/dummy/Mistral-7B-Instruct-v0.2"
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"output_cache_{strategy}_binpacking.json")
-    metrics = {
-        "iteration": iteration,
-        "total_time": end - start,
-        "throughput": tokens / (end - start),
-        "generation_results": [
-            {
-                "taskID": task.taskID,
-                "workload": task.workload,
-                "prompt": task.prompt,
-                "response": task.response,
-                "step": task.step,
-                "metrics": task.metrics,
-            }
-            for task in preloaded_tasks
-        ],
-    }
-    save_metrics_with_order(metrics, output_file)
-    print(f"Metrics saved to {output_file}")
+    # scheduler = Scheduler(lambda1=0.5, lambda2=0.5)
+    # max_workers=3 if strategy == "async" else 2
+    # bin_kwargs = {
+    #     "attn_implementation": attn_implementation,
+    #     "max_workers": max_workers,
+    #     "max_length": 1024,
+    #     "strategy": strategy,
+    #     "optimizer": optimizer,
+    #     "eval_metrics": True,
+    # }
+    # iteration = 0
+    # tokens = 0
+    # while task_queue.qsize() > 0:
+    #     print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
+    #     tokens += task_queue.qsize()
+    #     # while task_queue.qsize() > 0:
+    #     #     _, taskID = task_queue.get(timeout=0.5)
+    #     #     bin.add_task(preloaded_tasks[taskID])
+    #     bin = scheduler.best_fit_allocate(task_queue, preloaded_tasks, model, **bin_kwargs)
+    #     print(f"\tBin allocation (prefill_batch {len(bin.prefill_batch)}, decode_batch {len(bin.decode_batch)}, train_batch {len(bin.train_batch)})")
+    #     bin.concurrent_execute(model, tokenizer, task_queue, **bin_kwargs)
+    #     iteration += 1
+    #     break
+        
+    # end = time.time()
+    # print(f"Completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
+
+    # # Save the task's prompt and response to a file
+    # output_dir = "profile_main/dummy/Mistral-7B-Instruct-v0.2"
+    # os.makedirs(output_dir, exist_ok=True)
+    # output_file = os.path.join(output_dir, f"output_cache_{strategy}_binpacking.json")
+    # metrics = {
+    #     "iteration": iteration,
+    #     "total_time": end - start,
+    #     "throughput": tokens / (end - start),
+    #     "generation_results": [
+    #         {
+    #             "taskID": task.taskID,
+    #             "workload": task.workload,
+    #             "prompt": task.prompt,
+    #             "response": task.response,
+    #             "step": task.step,
+    #             "metrics": task.metrics,
+    #         }
+    #         for task in preloaded_tasks
+    #     ],
+    # }
+    # save_metrics_with_order(metrics, output_file)
+    # print(f"Metrics saved to {output_file}")
