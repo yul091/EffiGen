@@ -10,7 +10,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task  
-from iteration_bin import Bin
+# from iteration_bin import Bin
 from iteration_scheduler import Scheduler
 from utils import save_metrics_with_order
 
@@ -55,8 +55,12 @@ def tokenize_and_align_labels(examples):
 
 
 if __name__ == "__main__":
+    import random 
+
+    random.seed(42)
     
     # Verify the number of available CUDA devices
+    device = 1
     strategy = "async"  # or "sync"
     attn_implementation = "flash_attention_2"  # or "triton"
     model_path = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -71,7 +75,7 @@ if __name__ == "__main__":
         # device_map="auto",
         use_cache=True,
         attn_implementation=attn_implementation,
-    ).to("cuda:0")
+    ).to(device)
     # Apply LoRA configuration
     lora_config = LoraConfig(
         r=16,  # LoRA rank
@@ -79,7 +83,7 @@ if __name__ == "__main__":
         target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
         lora_dropout=0.05,
         task_type="CAUSAL_LM",
-        bias="none"
+        bias="none",
     )
     # Wrap model with LoRA
     model = get_peft_model(model, lora_config)
@@ -88,17 +92,13 @@ if __name__ == "__main__":
     model.generation_config.pad_token_id = tokenizer.pad_token_id
     # Get optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-    # # Get batch collator
-    # batch_collator = DPOCollator(
-    #     tokenizer, 
-    #     inference_input_feature="input_ids", 
-    #     inference_mask_feature="attention_mask",
-    # )
     
     # Load dataset 
     rlhf_data = load_dataset("data/Anthropic")
-    test_dataset = rlhf_data["test"].select(range(5))
-    train_dataset = rlhf_data["train"].select(range(5))
+    test_indices = random.sample(range(len(rlhf_data["test"])), 25)
+    test_dataset = rlhf_data["test"].select(test_indices)
+    train_indices = random.sample(range(len(rlhf_data["train"])), 10)
+    train_dataset = rlhf_data["train"].select(train_indices)
     processed_test_dataset = test_dataset.map(
         tokenize_and_align_labels,
         batched=True,
@@ -142,8 +142,6 @@ if __name__ == "__main__":
     start = time.time()
     # bin = Bin(eval_metrics=True)
     scheduler = Scheduler(lambda1=0.5, lambda2=0.5)
-    iteration = 0
-    tokens = 0
     max_workers=3 if strategy == "async" else 2
     bin_kwargs = {
         "attn_implementation": attn_implementation,
@@ -153,6 +151,8 @@ if __name__ == "__main__":
         "optimizer": optimizer,
         "eval_metrics": True,
     }
+    iteration = 0
+    tokens = 0
     while task_queue.qsize() > 0:
         print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
         tokens += task_queue.qsize()
@@ -160,9 +160,10 @@ if __name__ == "__main__":
         #     _, taskID = task_queue.get(timeout=0.5)
         #     bin.add_task(preloaded_tasks[taskID])
         bin = scheduler.best_fit_allocate(task_queue, preloaded_tasks, model, **bin_kwargs)
-        print(f"\t\tBin allocation (prefill_batch {len(bin.prefill_batch)}, decode_batch {len(bin.decode_batch)}, train_batch {len(bin.train_batch)})")
+        print(f"\tBin allocation (prefill_batch {len(bin.prefill_batch)}, decode_batch {len(bin.decode_batch)}, train_batch {len(bin.train_batch)})")
         bin.concurrent_execute(model, tokenizer, task_queue, **bin_kwargs)
         iteration += 1
+        break
         
     end = time.time()
 
@@ -179,11 +180,10 @@ if __name__ == "__main__":
         "generation_results": [
             {
                 "taskID": task.taskID,
+                "workload": task.workload,
                 "prompt": task.prompt,
                 "response": task.response,
-                "workload": task.workload,
                 "step": task.step,
-                # "rate_lambda": task.rate_lambda,
                 "metrics": task.metrics,
             }
             for task in preloaded_tasks

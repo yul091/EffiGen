@@ -24,10 +24,10 @@ class Bin:
 
     def __init__(
         self,
+        device: int = 0,
         inference_input_feature: str = "input_ids",
         inference_mask_feature: str = "attention_mask",
         eval_metrics: bool = True,
-        memory_capacity: Optional[float] = None,
     ):
         self.inference_input_feature = inference_input_feature
         self.inference_mask_feature = inference_mask_feature
@@ -36,8 +36,8 @@ class Bin:
         self.train_batch: List[Task] = []
         self.eval_metrics = eval_metrics
         # Initialize memory and latency
-        self.memory_capacity = memory_capacity if memory_capacity is not None else torch.cuda.get_device_properties(0).total_memory
-        self.total_memory = 0 
+        self.memory_capacity = torch.cuda.get_device_properties(device).total_memory / (1024**2)  # MB
+        self.total_memory = torch.cuda.max_memory_allocated(device) / (1024**2)  # MB
         self.max_latency = 0
         self.free_memory = self.memory_capacity
         
@@ -64,7 +64,7 @@ class Bin:
             self.total_memory += memory
             self.max_latency = max(self.max_latency, latency)
             if self.free_memory < memory:
-                logging.warning(f"Memory overflow! Memory preallocation: {self.total_memory} bytes, capacity: {self.memory_capacity} bytes")
+                logging.warning(f"Memory overflow! Preallocate: {self.total_memory} MB, capacity: {self.memory_capacity} MB")
             self.free_memory = max(self.memory_capacity - self.total_memory, 0)
         elif operation == "clear":
             self.total_memory = 0
@@ -275,6 +275,7 @@ class Bin:
     ):
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             if strategy == "sync":
+                # print(f"Sequantial execution (prioritize training)!")
                 # Prioritize the training workload
                 if self.train_batch:
                     self.execute(self.train_batch, model, tokenizer, "train", task_queue, **kwargs)
@@ -285,6 +286,7 @@ class Bin:
                     executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, **kwargs)
 
             elif strategy == "async":
+                # print(f"Concurrent execution (prioritize inference)!")
                 for workload, batch in [
                     ("train", self.train_batch),
                     ("prefill", self.prefill_batch),

@@ -8,9 +8,9 @@ from transformers.cache_utils import DynamicCache
 class Task:
 
     coefficients = {
-        "prefill": {"base_priority": 5, "priority_factor": 5e-2, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
-        "decode": {"base_priority": 10, "priority_factor": 1e-2, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
-        "train": {"base_priority": 1, "priority_factor": 1e-1, "latency_coeff": 1e-2, "memory_coeff": 1e-2},
+        "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
+        "decode": {"base_priority": -10, "priority_factor": -1e-2, "latency_coeff": 9.1e-7, "memory_coeff": 3.9e-5},
+        "train": {"base_priority": -1, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
     }
 
     CONTEXT_FEATURE = "context_input_ids"
@@ -80,17 +80,20 @@ class Task:
         self,
         model: LlamaForCausalLM,
         attn_implementation: str = "flash_attention_2",
+        new_seq_length: Optional[int] = None,
     ) -> Tuple[float, float]:
         """
         Estimate the workload based on the model and input.
         This is a placeholder function and should be replaced with actual profiling logic.
         """
         basic_factor = model.model.config.num_hidden_layers * model.model.config.hidden_size  # num_layers * hidden_dim
-        length_multiplier = len(self.input_kwargs[self.CONTEXT_FEATURE]) \
-            if attn_implementation == "flash_attention_2" else len(self.input_kwargs[self.CONTEXT_FEATURE])**2
-        memory = basic_factor * length_multiplier * self.coefficients[self.workload]["memory_coeff"]
+        if new_seq_length is None:
+            new_seq_length = len(self.input_kwargs[self.CONTEXT_FEATURE]) if self.workload != "decode" else 1
+        length_multiplier = new_seq_length if attn_implementation == "flash_attention_2" else new_seq_length**2
+        memory_delta = basic_factor * length_multiplier * self.coefficients[self.workload]["memory_coeff"]
         latency = basic_factor * length_multiplier * self.coefficients[self.workload]["latency_coeff"]
-        return memory, latency
+        # print(f"\t[Task {self.taskID} ({self.workload}) with {new_seq_length} new tokens] memory: {memory_delta}, latency: {latency}")
+        return memory_delta, latency
         
         
 

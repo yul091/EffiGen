@@ -53,13 +53,13 @@ class Scheduler:
                 best_bin.update_workload(operation="add", memory=memory, latency=latency)
             else:  
                 # current bins are exhausted
-                new_bin = Bin(eval_metrics=bin_kwargs.get("eval_metrics", False))
+                new_bin = Bin(device=model.device, eval_metrics=bin_kwargs.get("eval_metrics", False))
                 new_bin.add_task(task)
                 new_bin.update_workload(operation="add", memory=memory, latency=latency)
                 bins.append(new_bin)
 
         # Put the remaining tasks (from remaining bin (if exists)) back into the queue
-        # print(f"  **  Current bins {bins}  **  ")
+        print(f"\tCurrent bins's anticipation: {[(bin.total_memory, bin.max_latency) for bin in bins]}")
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
