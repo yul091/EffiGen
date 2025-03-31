@@ -28,6 +28,7 @@ class Scheduler:
         attn_implementation: str = "flash_attention_2",
         eval_metrics: bool = False,
         memory_threshold: Optional[float] = 0.95,
+        task_limit: Optional[int] = 50,
     ) -> Tuple[Bin, bool]:
         """
         Priority-aware best-fit bin packing considering both memory & latency.
@@ -35,9 +36,9 @@ class Scheduler:
         bins: List[Bin] = []
         reach_end = False
         initial_qsize = task_queue.qsize()
-
+        task_count = 0
         while task_queue.qsize() > 0:
-            if bins and bins[0].total_memory >= memory_threshold * bins[0].memory_capacity:
+            if bins and bins[0].total_memory >= memory_threshold * bins[0].memory_capacity or task_count >= task_limit:
                 break
             _, taskID = task_queue.get()
             if taskID is None:
@@ -47,6 +48,7 @@ class Scheduler:
                 break
 
             task: Task = preloaded_tasks[taskID]
+            task_count += 1
             best_bin, best_score = None, float('inf')
             # Get task workload anticipation
             memory, latency = task.get_workload(model, attn_implementation=attn_implementation)
@@ -76,7 +78,7 @@ class Scheduler:
         # Put the remaining tasks (from remaining bin (if exists)) back into the queue
         # print(f" - Current bins's anticipation: {[(bin.total_memory, bin.max_latency) for bin in bins]}")
         if bins:
-            print(f" ** [Iteration {iteration}] queue size {initial_qsize}, {initial_qsize - task_queue.qsize()} tasks participated, {bins[0].get_num_tasks()} tasks scheduled (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}), {len(bins)} bins created")
+            print(f"  **  [Iteration {iteration}] queue size {initial_qsize}, {initial_qsize - task_queue.qsize()} tasks participated, {bins[0].get_num_tasks()} tasks scheduled (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}), {len(bins)} bins created  **")
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:

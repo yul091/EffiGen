@@ -18,13 +18,13 @@ class Producer:
         self,
         arrival_rate: float,
         retrain_rate: float,
-        arrival_pattern: Optional[str] = None,
-        n_test_samples: Optional[int] = None,
+        n_test_samples: int,
+        arrival_pattern: str = "poisson",
     ):
         self.arrival_rate = arrival_rate
         self.retrain_rate = retrain_rate
-        self.arrival_pattern = arrival_pattern if arrival_pattern is not None else "poisson"
-        self.n_test_samples = n_test_samples if n_test_samples is not None else 100
+        self.arrival_pattern = arrival_pattern
+        self.n_test_samples = n_test_samples 
         self.n_train_samples = int(self.n_test_samples * retrain_rate)
         
 
@@ -124,7 +124,7 @@ class Producer:
 
         # print(f"Actually tasks {[task.workload for task in preloaded_tasks]}, train {sum([task.workload == 'train' for task in preloaded_tasks])}, test {sum([task.workload == 'prefill' for task in preloaded_tasks])}")
         # pdb.set_trace()
-        print(f"Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)")
+        print(f"  **  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  **")
         return preloaded_tasks
     
 

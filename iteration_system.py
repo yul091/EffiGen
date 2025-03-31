@@ -9,6 +9,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorLis
 import sys 
 sys.dont_write_bytecode = True
 import argparse 
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task  
 from iteration_producer import Producer
 from iteration_scheduler import Scheduler
@@ -72,8 +74,8 @@ class EffiGenTune:
         self.producer = Producer(
             arrival_rate=self.arrival_rate, 
             retrain_rate=self.retrain_rate, 
-            arrival_pattern=self.arrival_pattern, 
             n_test_samples=self.n_test_samples,
+            arrival_pattern=self.arrival_pattern, 
         )
 
         # Create scheduler
@@ -171,15 +173,23 @@ class EffiGenTune:
             )
 
         # Create iteration bin and execute tasks
-        # start = time.time()
-        # bin = Bin(eval_metrics=True)
         task_queue = PriorityQueue()
-        # Produce tasks
-        self.producer.produce(task_queue, preloaded_tasks)
-        start = time.time()
-        # Execute tasks
         record_metrics = {}
-        self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
+        start = time.time()
+
+        # # Produce tasks
+        # self.producer.produce(task_queue, preloaded_tasks)
+        # # Execute tasks
+        # self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Start the producer in a separate thread
+            executor.submit(self.producer.produce, task_queue, preloaded_tasks)
+
+            # Start the executor in main thread
+            # self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
+            executor.submit(self.executor, task_queue, preloaded_tasks, record_metrics=record_metrics)
+
         end = time.time()
         print(f"Total time: {end - start}, throughput: {record_metrics['tokens'] / (end - start)} tokens/sec")
 
@@ -188,13 +198,16 @@ class EffiGenTune:
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
+        eval_metrics = self.compute_metrics(preloaded_tasks)
         metrics = {
             "arrival_rate": self.arrival_rate,
             "retrain_rate": self.retrain_rate,
             "strategy": self.strategy,
+            "num_test_samples": self.n_test_samples,
             "iteration": record_metrics["iteration"],
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),
+            "metrics": eval_metrics,
             "generation_results": [
                 {
                     "taskID": task.taskID,
@@ -208,13 +221,42 @@ class EffiGenTune:
             ],
         }
         save_metrics_with_order(metrics, output_file)
-        print(f"Metrics saved to {output_file}")
+
+
+    def compute_metrics(self, preloaded_tasks: List[Task]) -> Dict[str, float]:
+        total_correct = 0
+        total_samples = 0
+        total_log_prob_diff = 0.0
+        total_perplexity = 0.0
+        total_loss = 0.0
+
+        for task in tqdm(preloaded_tasks, desc="Averaging metrics", total=len(preloaded_tasks)):
+            if task.workload == "train":
+                continue
+            eval_outputs = task.metrics
+            # print(f"Eval metrics: {eval_outputs}")
+            total_loss += eval_outputs["loss"]
+            total_perplexity += eval_outputs["perplexity"]
+            total_correct += eval_outputs["correct_preds"]
+            total_samples += 1
+            total_log_prob_diff += eval_outputs["log_prob_diff"]
+
+        # Compute final averages
+        preference_accuracy = total_correct / total_samples
+        avg_clpd = total_log_prob_diff / total_samples
+        avg_perplexity = total_perplexity / total_samples
+        avg_loss = total_loss / total_samples
+
+        return {
+            "preference accuracy": preference_accuracy,
+            "contrastive log probability difference (CLPD)": avg_clpd,
+            "perplexity": avg_perplexity,
+            "loss": avg_loss,
+        }
         
 
 
 if __name__ == "__main__":    
-    import random
-    from datasets import load_dataset
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0, help="GPU device number")

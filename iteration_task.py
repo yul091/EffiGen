@@ -9,7 +9,7 @@ class Task:
 
     coefficients = {
         "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
-        "decode": {"base_priority": -10, "priority_factor": -1e-2, "latency_coeff": 9.1e-7, "memory_coeff": 3.9e-5},
+        "decode": {"base_priority": -10, "priority_factor": -1e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
         "train": {"base_priority": -1, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
     }
 
