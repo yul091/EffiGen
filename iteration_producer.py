@@ -138,6 +138,6 @@ class Producer:
             # Essentially, we are using preloaded data (task ID)
             task_queue.put((task.get_priority(initial=True), taskID))
             
-        # task_queue.put((float('inf'), None))  # Signal the end of the dataset
+        task_queue.put((float('inf'), None))  # Signal the end of the dataset
         print("Producer finished producing tasks")
 

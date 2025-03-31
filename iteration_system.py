@@ -82,19 +82,18 @@ class EffiGenTune:
         # Get arguments
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
  
-        # self.bin_kwargs = {
-        #     "max_new_tokens": 1024,
-        #     "logits_processor": LogitsProcessorList([
-        #         MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=self.device),
-        #     ]),
-        #     "batch_collator": DPOCollator(
-        #         self.tokenizer, 
-        #         inference_input_feature="input_ids", 
-        #         inference_mask_feature="attention_mask",
-        #     ),
-        #     "generation_config": None,
-        # }
-        # self.bin_kwargs = {}
+        self.bin_kwargs = {
+            "max_new_tokens": 1024,
+            "logits_processor": LogitsProcessorList([
+                MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=self.device),
+            ]),
+            "batch_collator": DPOCollator(
+                self.tokenizer, 
+                inference_input_feature="input_ids", 
+                inference_mask_feature="attention_mask",
+            ),
+            "generation_config": None,
+        }
 
 
     def executor(
@@ -113,39 +112,44 @@ class EffiGenTune:
         record_metrics = record_metrics if record_metrics is not None else {}
         record_metrics["iteration"] = 0
         record_metrics["tokens"] = 0
-        # while True:
-        while task_queue.qsize() > 0:
-            # qsize = task_queue.qsize()
-            # if qsize == 0:
-            #     # print("No tasks in the queue. Waiting for tasks...")
-            #     time.sleep(0.01)
-            #     continue
+        
+        while True:
+        # while task_queue.qsize() > 0:
+            qsize = task_queue.qsize()
+            if qsize == 0:
+                # print("No tasks in the queue. Waiting for tasks...")
+                time.sleep(0.01)
+                continue
             # print(f" ** [Iteration {iteration+1}] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]}\n")
             # tokens += task_queue.qsize()
-            record_metrics["tokens"] += task_queue.qsize()
+            record_metrics["tokens"] += qsize
             # while qsize > 0:
             #     _, taskID = task_queue.get(timeout=0.5)
             #     bin.add_task(preloaded_tasks[taskID])
-            bin = self.scheduler.best_fit_allocate(
+            bin, reach_end = self.scheduler.best_fit_allocate(
                 task_queue, 
                 preloaded_tasks, 
-                self.model, 
+                iteration=record_metrics["iteration"],
+                model=self.model, 
                 attn_implementation=self.attn_implementation,
                 eval_metrics=True,
             )
-            # print(f" ** [After scheduling] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]} - Bin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
+            # print(f" ** [Iteration {iteration+1}] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]} - Bin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
             bin.concurrent_execute(
                 model=self.model, 
                 tokenizer=self.tokenizer, 
                 task_queue=task_queue, 
                 strategy=self.strategy,
                 optimizer=self.optimizer,
-                # **self.bin_kwargs,
+                **self.bin_kwargs,
             )
             # print(f" **  [After execution] Bin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
             # print(f" ** [After execution] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]}\n")
             # iteration += 1
             record_metrics["iteration"] += 1
+            if reach_end and task_queue.qsize() == 1:  # 1 because we always put back the end signal
+                print("Executor reached the end of the preloaded tasks.")
+                break
 
         print(f"Execution completed in {record_metrics['iteration']} iterations!")
         
@@ -183,8 +187,11 @@ class EffiGenTune:
         # Save the task's prompt and response to a file
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"output_cache_{self.strategy}_system.json")
+        output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
         metrics = {
+            "arrival_rate": self.arrival_rate,
+            "retrain_rate": self.retrain_rate,
+            "strategy": self.strategy,
             "iteration": record_metrics["iteration"],
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),

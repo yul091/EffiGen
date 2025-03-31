@@ -54,6 +54,10 @@ class Bin:
             raise ValueError(f"Invalid workload: {task.workload}")
         
 
+    def get_num_tasks(self) -> int:
+        return len(self.prefill_batch) + len(self.decode_batch) + len(self.train_batch)
+        
+
     def update_workload(self, operation: str = "add", memory: float = 0, latency: float = 0):
         """
         Estimate the resource consumption of all workloads in the bin. Update the free memory and max latency.
