@@ -134,13 +134,13 @@ class Bin:
         tokenizer: LlamaTokenizer,
         do_sample: bool = False,
         logits_processor: Optional[Callable] = None,
-        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
         past_key_values: Optional[DynamicCache] = None,
     ):
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList(
             [MinLengthLogitsProcessor(1, eos_token_id=tokenizer.eos_token_id, device=input_ids.device),]
         )
-        max_length = max_length if max_length is not None else 1024
+        max_new_tokens = max_new_tokens if max_new_tokens is not None else 1024
         # Finished sentences should have their next token be a padding token
         batch_size = lm_logits.shape[0]  # shape: [B, S, V]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
@@ -159,9 +159,10 @@ class Bin:
     
         # Update task status
         for i, task in enumerate(batch):
+            # print(f"Task {task.taskID} (step {task.step}, workload {task.workload}), current task queue {task_queue.queue}")
             task.update_decoding(next_tokens[i].item())
             # if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
-            if unfinished_sequences[i] == 1 and task.step < max_length: # continue decoding
+            if unfinished_sequences[i] == 1 and task.step < max_new_tokens: # continue decoding
                 # Update past key values [batch_size, num_heads, seq_len, head_dim]
                 if past_key_values is None:  
                     continue
@@ -190,12 +191,11 @@ class Bin:
         tokenizer: LlamaTokenizer,
         workload: str,
         task_queue: PriorityQueue,
+        optimizer: torch.optim.Optimizer,
         batch_collator: Optional[DPOCollator] = None,
-        optimizer: Optional[torch.optim.Optimizer] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
-        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
         generation_config: Optional[Dict[str, Any]] = None,
-        **kwargs,
     ):
         if not batch:
             return 
@@ -203,7 +203,6 @@ class Bin:
         inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
         if workload == "train":
             model.train()
-            optimizer = optimizer if optimizer is not None else torch.optim.Adam(model.parameters(), lr=5e-5)
             optimizer.zero_grad()
             losses = dpo_loss(model, inputs, return_average=False)
             losses.mean().backward()
@@ -256,7 +255,7 @@ class Bin:
                 tokenizer=tokenizer,
                 do_sample=generation_config.do_sample,
                 logits_processor=logits_processor,
-                max_length=max_length,
+                max_new_tokens=max_new_tokens,
                 past_key_values=outputs.past_key_values,
             ) 
 
@@ -269,21 +268,22 @@ class Bin:
         model: LlamaForCausalLM,
         tokenizer: LlamaTokenizer,
         task_queue: PriorityQueue,
-        strategy: str = "sync",
-        max_workers: int = 3,
+        strategy: str,
+        optimizer: torch.optim.Optimizer,
         **kwargs,
     ):
+        max_workers = 3 if strategy == "async" else 2
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             if strategy == "sync":
                 # print(f"Sequantial execution (prioritize training)!")
                 # Prioritize the training workload
                 if self.train_batch:
-                    self.execute(self.train_batch, model, tokenizer, "train", task_queue, **kwargs)
+                    self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, **kwargs)
                 for workload, batch in [
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, **kwargs)
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
 
             elif strategy == "async":
                 # print(f"Concurrent execution (prioritize inference)!")
@@ -292,7 +292,7 @@ class Bin:
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, **kwargs)
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
             else:
                 raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
 

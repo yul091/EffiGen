@@ -2,7 +2,7 @@
 from typing import List, Dict, Any, Optional
 import time
 import random
-import logging
+import pdb
 from queue import PriorityQueue
 import sys 
 sys.dont_write_bytecode = True
@@ -96,30 +96,35 @@ class Producer:
 
         # Preloaded tasks
         preloaded_tasks: List[Task] = []
-        for i, test_example in enumerate(processed_test_dataset):
-            task = Task(
-                taskID=i,
-                workload="prefill", 
-                rate_lambda=self.arrival_rate, 
-                prompt=test_dataset[i]["context"],
-                input_kwargs=test_example,
-            )
-            preloaded_tasks.append(task)
-            
-        accum = len(processed_test_dataset)
-        for j, train_example in enumerate(processed_train_dataset):
-            task = Task(
-                taskID=accum+j,
-                workload="train", 
-                rate_lambda=self.arrival_rate, 
-                prompt=train_dataset[j]["context"],
-                input_kwargs=train_example,
-            )
+        train_prob = self.retrain_rate / (self.retrain_rate + 1)
+        train_idx, test_idx = 0, 0
+        for taskID in range(self.n_train_samples + self.n_test_samples):
+            if (random.random() < train_prob and train_idx < self.n_train_samples) or (test_idx == self.n_test_samples):
+                # Add a train task
+                task = Task(
+                    taskID=taskID,
+                    workload="train", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=train_dataset[train_idx]["context"],
+                    input_kwargs=processed_train_dataset[train_idx],
+                )
+                train_idx += 1
+            else:
+                # Add a test task
+                task = Task(
+                    taskID=taskID,
+                    workload="prefill", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=test_dataset[test_idx]["context"],
+                    input_kwargs=processed_test_dataset[test_idx],
+                )
+                test_idx += 1
+
             preloaded_tasks.append(task)
 
-        # Shuffle the dataset
-        random.shuffle(preloaded_tasks)
-        print(f"Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({self.n_test_samples * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({self.n_train_samples * 100 / len(preloaded_tasks):.2f}%)")
+        # print(f"Actually tasks {[task.workload for task in preloaded_tasks]}, train {sum([task.workload == 'train' for task in preloaded_tasks])}, test {sum([task.workload == 'prefill' for task in preloaded_tasks])}")
+        # pdb.set_trace()
+        print(f"Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)")
         return preloaded_tasks
     
 
@@ -133,6 +138,6 @@ class Producer:
             # Essentially, we are using preloaded data (task ID)
             task_queue.put((task.get_priority(initial=True), taskID))
             
-        task_queue.put((float('inf'), None))  # Signal the end of the dataset
-        logging.info("Producer finished producing tasks")
+        # task_queue.put((float('inf'), None))  # Signal the end of the dataset
+        print("Producer finished producing tasks")
 
