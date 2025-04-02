@@ -40,6 +40,7 @@ class EffiGenTune:
         self.n_test_samples = args.n_test_samples
         self.retrain_rate = args.retrain_rate
         self.output_dir = args.output_dir
+        self.max_new_tokens = args.max_new_tokens
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, padding_side="left", use_fast=True)
@@ -85,7 +86,7 @@ class EffiGenTune:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
  
         self.bin_kwargs = {
-            "max_new_tokens": 1024,
+            "max_new_tokens": self.max_new_tokens,
             "logits_processor": LogitsProcessorList([
                 MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=self.device),
             ]),
@@ -125,9 +126,6 @@ class EffiGenTune:
             # print(f" ** [Iteration {iteration+1}] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]}\n")
             # tokens += task_queue.qsize()
             record_metrics["tokens"] += qsize
-            # while qsize > 0:
-            #     _, taskID = task_queue.get(timeout=0.5)
-            #     bin.add_task(preloaded_tasks[taskID])
             bin, reach_end = self.scheduler.best_fit_allocate(
                 task_queue, 
                 preloaded_tasks, 
@@ -169,6 +167,7 @@ class EffiGenTune:
             preloaded_tasks = self.producer.load_dataset(
                 tokenizer=self.tokenizer,
                 max_length=self.max_context_length,
+                strategy=self.strategy,
                 dataset_name=self.data_path,
             )
 
@@ -234,18 +233,21 @@ class EffiGenTune:
             if task.workload == "train":
                 continue
             eval_outputs = task.metrics
-            # print(f"Eval metrics: {eval_outputs}")
-            total_loss += eval_outputs["loss"]
-            total_perplexity += eval_outputs["perplexity"]
-            total_correct += eval_outputs["correct_preds"]
-            total_samples += 1
-            total_log_prob_diff += eval_outputs["log_prob_diff"]
+            try:
+                total_loss += eval_outputs["loss"]
+                total_perplexity += eval_outputs["perplexity"]
+                total_correct += eval_outputs["correct_preds"]
+                total_samples += 1
+                total_log_prob_diff += eval_outputs["log_prob_diff"]
+            except KeyError as e:
+                print(f"KeyError: {e} in task {task.taskID}. Skipping this task.")
+                continue
 
         # Compute final averages
-        preference_accuracy = total_correct / total_samples
-        avg_clpd = total_log_prob_diff / total_samples
-        avg_perplexity = total_perplexity / total_samples
-        avg_loss = total_loss / total_samples
+        preference_accuracy = total_correct / total_samples if total_samples > 0 else 0
+        avg_clpd = total_log_prob_diff / total_samples if total_samples > 0 else 0
+        avg_perplexity = total_perplexity / total_samples if total_samples > 0 else 0
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
 
         return {
             "preference accuracy": preference_accuracy,
@@ -272,6 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--memory_weight", type=float, default=0.5, help="Weight for memory in scheduling")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer")
     parser.add_argument("--output_dir", type=str, default="profile_main/dummy", help="Output directory for saving metrics")
+    parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum number of new tokens to generate")
     args = parser.parse_args()
     
     

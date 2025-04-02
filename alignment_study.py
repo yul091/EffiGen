@@ -600,8 +600,12 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
+    n_test_samples = 200
+    retrain_rate = 0.1
+    n_train_samples = int(n_test_samples * retrain_rate)
+
     # === Load Model & Tokenizer ===
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name = "mistralai/Mistral-7B-Instruct-v0.2"  # "meta-llama/Meta-Llama-3-8B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -639,9 +643,9 @@ if __name__ == "__main__":
     max_length = model.config.max_position_embeddings
     
     # Load and process datasets
-    test_train_rate = 5
+    test_train_rate = int(1 / retrain_rate)
     rlhf_data = load_dataset("data/Anthropic")
-    train_samples = min(50, len(rlhf_data["train"]))
+    train_samples = min(n_train_samples, len(rlhf_data["train"]))
     train_dataset = rlhf_data["train"].select(range(train_samples))
     processed_train_dataset = train_dataset.map(
         tokenize_and_align_labels, 

@@ -32,6 +32,7 @@ class Producer:
         self, 
         tokenizer: AutoTokenizer,
         max_length: int,
+        strategy: str,
         dataset_name: str = "data/Anthropic",
     ) -> List[Task]:
         """
@@ -94,6 +95,23 @@ class Producer:
             load_from_cache_file=False,
         ).remove_columns(train_dataset.column_names)
 
+        # Predefine task priority coefficients
+        if strategy == "async":
+            coefficients = {
+                "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
+                "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
+                "train": {"base_priority": -2, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
+            }
+        elif strategy == "sync":
+            # If sync, we always prioritize training tasks
+            coefficients = {
+                "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
+                "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
+                "train": {"base_priority": -1000, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
+            }
+        else:
+            raise ValueError(f"Invalid strategy: {strategy}")
+
         # Preloaded tasks
         preloaded_tasks: List[Task] = []
         train_prob = self.retrain_rate / (self.retrain_rate + 1)
@@ -107,6 +125,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=train_dataset[train_idx]["context"],
                     input_kwargs=processed_train_dataset[train_idx],
+                    coefficients=coefficients,
                 )
                 train_idx += 1
             else:
@@ -117,6 +136,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[test_idx]["context"],
                     input_kwargs=processed_test_dataset[test_idx],
+                    coefficients=coefficients,
                 )
                 test_idx += 1
 

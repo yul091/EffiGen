@@ -36,7 +36,7 @@ class Scheduler:
         bins: List[Bin] = []
         reach_end = False
         initial_qsize = task_queue.qsize()
-        task_count = 0
+        task_count, train_task_count = 0, 0
         while task_queue.qsize() > 0:
             if bins and bins[0].total_memory >= memory_threshold * bins[0].memory_capacity or task_count >= task_limit:
                 break
@@ -49,6 +49,7 @@ class Scheduler:
 
             task: Task = preloaded_tasks[taskID]
             task_count += 1
+            train_task_count += task.workload == "train"
             best_bin, best_score = None, float('inf')
             # Get task workload anticipation
             memory, latency = task.get_workload(model, attn_implementation=attn_implementation)
@@ -76,9 +77,8 @@ class Scheduler:
                 # print(f" - Task {taskID} ({task.workload}) is assigned to bin {bins.index(new_bin)} (with accum memory {new_bin.total_memory} and max latency {new_bin.max_latency})")
 
         # Put the remaining tasks (from remaining bin (if exists)) back into the queue
-        # print(f" - Current bins's anticipation: {[(bin.total_memory, bin.max_latency) for bin in bins]}")
         if bins:
-            print(f"  **  [Iteration {iteration}] queue size {initial_qsize}, {initial_qsize - task_queue.qsize()} tasks participated, {bins[0].get_num_tasks()} tasks scheduled (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}), {len(bins)} bins created  **")
+            print(f"  **  [Iteration {iteration}] queue size {initial_qsize}, involve {task_count} tasks (train {train_task_count}), schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}), {len(bins)} bins created  **")
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
