@@ -47,6 +47,7 @@ class Task:
         self.past_key_values = past_key_values
         self.step = 0
         self.release_time = None
+        self.execution_time = None
         self.priority = self.get_priority(initial=True)
         self.response = ""
         self.metrics = {}

@@ -2,7 +2,6 @@
 import os
 from typing import List, Optional, Dict, Any
 import time
-from queue import PriorityQueue
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, MinLengthLogitsProcessor
@@ -10,10 +9,12 @@ import sys
 sys.dont_write_bytecode = True
 import argparse 
 from tqdm import tqdm
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task  
 from iteration_producer import Producer
 from iteration_scheduler import Scheduler
+from iteration_queue import IterQueue, heapify
 from alignment_study import DPOCollator
 from utils import save_metrics_with_order
 
@@ -41,6 +42,8 @@ class EffiGenTune:
         self.retrain_rate = args.retrain_rate
         self.output_dir = args.output_dir
         self.max_new_tokens = args.max_new_tokens
+        self.memory_threshold = args.memory_threshold
+        self.task_limit = args.task_limit
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, padding_side="left", use_fast=True)
@@ -101,13 +104,13 @@ class EffiGenTune:
 
     def executor(
         self, 
-        task_queue: PriorityQueue, 
+        task_queue: IterQueue, 
         preloaded_tasks: List[Task], 
         record_metrics: Optional[Dict[str, Any]] = None,
     ):
         """
         Executor function to run the tasks in the queue.
-        - task_queue (PriorityQueue): Queue of tasks to be executed.
+        - task_queue (IterQueue): Queue of tasks to be executed.
         - preloaded_tasks (List[Task]): List of preloaded tasks.
         """
         # iteration = 0
@@ -123,7 +126,7 @@ class EffiGenTune:
                 # print("No tasks in the queue. Waiting for tasks...")
                 time.sleep(0.01)
                 continue
-            # print(f" ** [Iteration {iteration+1}] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]}\n")
+            
             # tokens += task_queue.qsize()
             record_metrics["tokens"] += qsize
             bin, reach_end = self.scheduler.best_fit_allocate(
@@ -133,8 +136,10 @@ class EffiGenTune:
                 model=self.model, 
                 attn_implementation=self.attn_implementation,
                 eval_metrics=True,
+                memory_threshold=self.memory_threshold,
+                task_limit=self.task_limit,
             )
-            # print(f" ** [Iteration {iteration+1}] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]} - Bin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
+            
             bin.concurrent_execute(
                 model=self.model, 
                 tokenizer=self.tokenizer, 
@@ -143,8 +148,6 @@ class EffiGenTune:
                 optimizer=self.optimizer,
                 **self.bin_kwargs,
             )
-            # print(f" **  [After execution] Bin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
-            # print(f" ** [After execution] Queue size {task_queue.qsize()} composition: {[preloaded_tasks[taskID].workload for _, taskID in task_queue.queue]}\n")
             # iteration += 1
             record_metrics["iteration"] += 1
             if reach_end and task_queue.qsize() == 1:  # 1 because we always put back the end signal
@@ -162,6 +165,25 @@ class EffiGenTune:
         - preloaded_tasks (List[Task]): List of preloaded tasks.
         """
 
+        def start_priority_refresher(task_queue: IterQueue, preloaded_tasks: List[Task], interval: float = 1.0):
+            def refresher_loop():
+                while True:
+                    with task_queue.mutex:
+                        for i, (priority, workload, taskID) in enumerate(task_queue.queue):
+                            if taskID is not None:
+                                task = preloaded_tasks[taskID]
+                                new_priority = task.get_priority(initial=False)
+                                task_queue.queue[i] = (new_priority, workload, taskID)
+                        heapify(task_queue.queue)
+                    # Print the task queue for debugging
+                    # print(f"  **  Task queue: {[(priority, workload, taskID) for priority, workload, taskID in task_queue.queue]} ** \n")
+                    time.sleep(interval)
+
+            thread = threading.Thread(target=refresher_loop, daemon=True)
+            thread.start()
+            return thread
+
+
         # Get preloaded tasks
         if preloaded_tasks is None:
             preloaded_tasks = self.producer.load_dataset(
@@ -172,14 +194,12 @@ class EffiGenTune:
             )
 
         # Create iteration bin and execute tasks
-        task_queue = PriorityQueue()
+        task_queue = IterQueue()
         record_metrics = {}
         start = time.time()
 
-        # # Produce tasks
-        # self.producer.produce(task_queue, preloaded_tasks)
-        # # Execute tasks
-        # self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
+        # ✅ Start background refresher
+        self.refresher_thread = start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Start the producer in a separate thread
@@ -215,6 +235,9 @@ class EffiGenTune:
                     "response": task.response,
                     "step": task.step,
                     "metrics": task.metrics,
+                    "release_time": task.release_time,
+                    "execution_time": task.execution_time,
+                    "priority": task.priority,
                 }
                 for task in preloaded_tasks
             ],
@@ -275,6 +298,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer")
     parser.add_argument("--output_dir", type=str, default="profile_main/dummy", help="Output directory for saving metrics")
     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum number of new tokens to generate")
+    parser.add_argument("--memory_threshold", type=float, default=0.95, help="Memory threshold for bin packing")
+    parser.add_argument("--task_limit", type=int, default=50, help="Task limit for bin packing")
     args = parser.parse_args()
     
     

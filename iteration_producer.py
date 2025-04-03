@@ -3,12 +3,12 @@ from typing import List, Dict, Any, Optional
 import time
 import random
 import pdb
-from queue import PriorityQueue
 import sys 
 sys.dont_write_bytecode = True
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from iteration_task import Task  
+from iteration_queue import IterQueue
 
 
 
@@ -96,21 +96,14 @@ class Producer:
         ).remove_columns(train_dataset.column_names)
 
         # Predefine task priority coefficients
-        if strategy == "async":
-            coefficients = {
-                "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
-                "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
-                "train": {"base_priority": -2, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
-            }
-        elif strategy == "sync":
+        coefficients = {
+            "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
+            "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
+            "train": {"base_priority": -2, "priority_factor": -2e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
+        }
+        if strategy == "sync":
             # If sync, we always prioritize training tasks
-            coefficients = {
-                "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
-                "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
-                "train": {"base_priority": -1000, "priority_factor": -1e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
-            }
-        else:
-            raise ValueError(f"Invalid strategy: {strategy}")
+            coefficients["train"]["base_priority"] = -10000
 
         # Preloaded tasks
         preloaded_tasks: List[Task] = []
@@ -149,15 +142,16 @@ class Producer:
     
 
 
-    def produce(self, task_queue: PriorityQueue, preloaded_tasks: List[Task]):
+    def produce(self, task_queue: IterQueue, preloaded_tasks: List[Task]):
 
         # Produce using the dataset
         for taskID, task in enumerate(preloaded_tasks):
-            print(f"  **  Producing task {taskID} ({task.workload})  **  ")
+            if task.workload == "train":
+                print(f"  **  Producing task {taskID} ({task.workload})  **  ")
             time.sleep(random.expovariate(task.rate_lambda))
             # Essentially, we are using preloaded data (task ID)
-            task_queue.put((task.get_priority(initial=True), taskID))
+            task_queue.put((task.get_priority(initial=True), task.workload, taskID))
             
-        task_queue.put((float('inf'), None))  # Signal the end of the dataset
+        task_queue.put((float('inf'), None, None))  # Signal the end of the dataset
         print("Producer finished producing tasks")
 

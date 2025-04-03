@@ -1,9 +1,11 @@
 # A definition of the bin packing class and supported functions.
 import os
+import gc
 import logging
 import sys 
 sys.dont_write_bytecode = True
 from typing import List, Optional, Dict, Any, Callable
+import time
 import torch
 import torch.nn as nn
 from transformers import (
@@ -13,9 +15,9 @@ from transformers import (
     MinLengthLogitsProcessor,
 )
 from transformers.cache_utils import DynamicCache, Cache
-from queue import PriorityQueue
 from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task
+from iteration_queue import IterQueue
 from alignment_study import DPOCollator, dpo_loss, compute_batch_metrics
 from utils import prepare_inputs
 
@@ -134,7 +136,7 @@ class Bin:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         lm_logits: torch.Tensor,
-        task_queue: PriorityQueue,
+        task_queue: IterQueue,
         tokenizer: LlamaTokenizer,
         do_sample: bool = False,
         logits_processor: Optional[Callable] = None,
@@ -181,10 +183,12 @@ class Bin:
                     )
                 # print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
                 # Add task back to queue
-                task_queue.put((task.get_priority(initial=False), task.taskID))
+                task_queue.put((task.get_priority(initial=False), task.workload, task.taskID))
             else:  # stop decoding
                 # Update response (text) with next token
                 task.get_response(tokenizer)
+                # Empty cache
+                task.past_key_values = None
                 
 
 
@@ -194,7 +198,7 @@ class Bin:
         model: LlamaForCausalLM,
         tokenizer: LlamaTokenizer,
         workload: str,
-        task_queue: PriorityQueue,
+        task_queue: IterQueue,
         optimizer: torch.optim.Optimizer,
         batch_collator: Optional[DPOCollator] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
@@ -205,91 +209,104 @@ class Bin:
             return 
         
         inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
-        if workload == "train":
-            model.train()
-            optimizer.zero_grad()
-            losses = dpo_loss(model, inputs, return_average=False)
-            losses.mean().backward()
-            optimizer.step()
-            # Update task status
-            for i, task in enumerate(batch):
-                task.metrics["loss"] = losses[i].item()
-        else:
-            model.eval()
-            with torch.no_grad():
-                generation_config, model_kwargs = model._prepare_generation_config(generation_config, **inputs)
-                model_kwargs = model._get_initial_cache_position(model_kwargs[self.inference_input_feature], model_kwargs)
-                # Handle decoding forward pass
-                model_forward = model.__call__
-                if isinstance(model_kwargs.get("past_key_values"), Cache):
-                    is_compileable = model_kwargs["past_key_values"].is_compileable and model._supports_static_cache
-                    is_compileable = is_compileable and not model.generation_config.disable_compile
-                    if is_compileable and (
-                        model.device.type == "cuda" or generation_config.compile_config._compile_all_devices
-                    ):
-                        os.environ["TOKENIZERS_PARALLELISM"] = "0"
-                        model_forward = model.get_compiled_call(generation_config.compile_config)
-                # Slicing the inputs based on cache positions
-                model_inputs = model.prepare_inputs_for_generation(**model_kwargs)
-                # Forward pass
-                if workload == "prefill":
-                    outputs = model(
-                        **model_inputs,
-                        return_dict=True,
-                    )  # [loss, logits, past_key_values, hidden_states, attentions]
-                    if self.eval_metrics:
-                        eval_outputs = compute_batch_metrics(model, inputs, compute_average=False)  # return batch results
-                        for i, task in enumerate(batch):
-                            for key, value in eval_outputs.items():
-                                task.metrics[key] = value[i].item()
-                            # task.metrics.update(eval_outputs)
-                else:
-                    outputs = model_forward(
-                        **model_inputs,
-                        return_dict=True,
-                    )
+        execution_time = time.time()
+        try:
+            if workload == "train":
+                model.train()
+                optimizer.zero_grad()
+                losses = dpo_loss(model, inputs, return_average=False)
+                losses.mean().backward()
+                optimizer.step()
+                # Update task status
+                for i, task in enumerate(batch):
+                    task.metrics["loss"] = losses[i].item()
+                    task.execution_time = execution_time
+                    print(f"Task {task.taskID} ({task.workload}) finished with loss {task.metrics['loss']}")
+            else:
+                model.eval()
+                with torch.no_grad():
+                    generation_config, model_kwargs = model._prepare_generation_config(generation_config, **inputs)
+                    model_kwargs = model._get_initial_cache_position(model_kwargs[self.inference_input_feature], model_kwargs)
+                    # Handle decoding forward pass
+                    model_forward = model.__call__
+                    if isinstance(model_kwargs.get("past_key_values"), Cache):
+                        is_compileable = model_kwargs["past_key_values"].is_compileable and model._supports_static_cache
+                        is_compileable = is_compileable and not model.generation_config.disable_compile
+                        if is_compileable and (
+                            model.device.type == "cuda" or generation_config.compile_config._compile_all_devices
+                        ):
+                            os.environ["TOKENIZERS_PARALLELISM"] = "0"
+                            model_forward = model.get_compiled_call(generation_config.compile_config)
+                    # Slicing the inputs based on cache positions
+                    model_inputs = model.prepare_inputs_for_generation(**model_kwargs)
+                    # Forward pass
+                    if workload == "prefill":
+                        outputs = model(
+                            **model_inputs,
+                            return_dict=True,
+                        )  # [loss, logits, past_key_values, hidden_states, attentions]
+                        if self.eval_metrics:
+                            eval_outputs = compute_batch_metrics(model, inputs, compute_average=False)  # return batch results
+                            for i, task in enumerate(batch):
+                                for key, value in eval_outputs.items():
+                                    task.metrics[key] = value[i].item()
+                                task.execution_time = execution_time
+                    else:
+                        # Decode the next token
+                        outputs = model_forward(
+                            **model_inputs,
+                            return_dict=True,
+                        )
 
-            # Decode the next tokens and update task status
-            self._batch_decoding(
-                batch=batch,
-                input_ids=model_kwargs[self.inference_input_feature],
-                attention_mask=model_kwargs[self.inference_mask_feature],
-                lm_logits=outputs.logits,
-                task_queue=task_queue,
-                tokenizer=tokenizer,
-                do_sample=generation_config.do_sample,
-                logits_processor=logits_processor,
-                max_new_tokens=max_new_tokens,
-                past_key_values=outputs.past_key_values,
-            ) 
+                # Decode the next tokens and update task status
+                self._batch_decoding(
+                    batch=batch,
+                    input_ids=model_kwargs[self.inference_input_feature],
+                    attention_mask=model_kwargs[self.inference_mask_feature],
+                    lm_logits=outputs.logits,
+                    task_queue=task_queue,
+                    tokenizer=tokenizer,
+                    do_sample=generation_config.do_sample,
+                    logits_processor=logits_processor,
+                    max_new_tokens=max_new_tokens,
+                    past_key_values=outputs.past_key_values,
+                ) 
+                
+        except Exception as e:
+            logging.error(f"Error during {workload} execution: {e}")
+            for task in batch:
+                task.execution_time = execution_time
+                task.response = "Error occurred during execution."
+                task.metrics["error"] = str(e)
 
         # Clear the batch
         batch.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
     def concurrent_execute(
         self,
         model: LlamaForCausalLM,
         tokenizer: LlamaTokenizer,
-        task_queue: PriorityQueue,
+        task_queue: IterQueue,
         strategy: str,
         optimizer: torch.optim.Optimizer,
         **kwargs,
     ):
-        max_workers = 3 if strategy == "async" else 2
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            if strategy == "sync":
-                # print(f"Sequantial execution (prioritize training)!")
-                # Prioritize the training workload
-                if self.train_batch:
-                    self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, **kwargs)
+        if strategy == "sync":
+            # print(f"Sequantial execution (prioritize training)!")
+            # Prioritize the training workload
+            if self.train_batch:
+                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, **kwargs)
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 for workload, batch in [
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
                     executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
-
-            elif strategy == "async":
+        elif strategy == "async":
+            with ThreadPoolExecutor(max_workers=3) as executor:
                 # print(f"Concurrent execution (prioritize inference)!")
                 for workload, batch in [
                     ("train", self.train_batch),
@@ -297,8 +314,8 @@ class Bin:
                     ("decode", self.decode_batch),
                 ]:
                     executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
-            else:
-                raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
 
     
 

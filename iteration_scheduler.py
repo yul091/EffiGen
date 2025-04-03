@@ -1,11 +1,11 @@
 # A definition of the Scheduler class and supported functions.
 from typing import List, Tuple, Optional
-from queue import PriorityQueue
 from transformers import AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
 from iteration_task import Task  
 from iteration_bin import Bin
+from iteration_queue import IterQueue
 
 
 class Scheduler:
@@ -21,7 +21,7 @@ class Scheduler:
 
     def best_fit_allocate(
         self, 
-        task_queue: PriorityQueue, 
+        task_queue: IterQueue, 
         preloaded_tasks: List[Task],
         iteration: int, 
         model: AutoModelForCausalLM,
@@ -35,21 +35,26 @@ class Scheduler:
         """
         bins: List[Bin] = []
         reach_end = False
-        initial_qsize = task_queue.qsize()
-        task_count, train_task_count = 0, 0
+        initial_qsize, itrain, iprefill, idecode = task_queue.qsize(), task_queue.train_size, task_queue.prefill_size, task_queue.decode_size
+        task_count, strain, sprefill, sdecode = 0, 0, 0, 0
         while task_queue.qsize() > 0:
             if bins and bins[0].total_memory >= memory_threshold * bins[0].memory_capacity or task_count >= task_limit:
                 break
-            _, taskID = task_queue.get()
+            _, _, taskID = task_queue.get()  # priority, workload, taskID
             if taskID is None:
                 # Reach the end of the preloaded tasks
-                task_queue.put((float('inf'), None))  # Put back the end signal since we may have unfinished decoding tasks
+                task_queue.put((float('inf'), None, None))  # Put back the end signal since we may have unfinished decoding tasks
                 reach_end = True
                 break
 
             task: Task = preloaded_tasks[taskID]
             task_count += 1
-            train_task_count += task.workload == "train"
+            if task.workload == "train":
+                strain += 1
+            elif task.workload == "prefill":
+                sprefill += 1
+            elif task.workload == "decode":
+                sdecode += 1
             best_bin, best_score = None, float('inf')
             # Get task workload anticipation
             memory, latency = task.get_workload(model, attn_implementation=attn_implementation)
@@ -78,11 +83,11 @@ class Scheduler:
 
         # Put the remaining tasks (from remaining bin (if exists)) back into the queue
         if bins:
-            print(f"  **  [Iteration {iteration}] queue size {initial_qsize}, involve {task_count} tasks (train {train_task_count}), schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}), {len(bins)} bins created  **")
+            print(f"  **  [Iteration {iteration}] queue size {initial_qsize} (prefill {iprefill}, decode {idecode}, train {itrain}) --- involve {task_count} tasks (prefill {sprefill}, decode {sdecode}, train {strain}) --- schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}) --- {len(bins)} bins created  **  ")
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
-                    task_queue.put((task.get_priority(initial=False), task.taskID))
+                    task_queue.put((task.get_priority(initial=False), task.workload, task.taskID))
 
         # Return the next bin for execution
         return bins[0] if bins else None, reach_end
