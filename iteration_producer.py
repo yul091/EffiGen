@@ -19,12 +19,14 @@ class Producer:
         arrival_rate: float,
         retrain_rate: float,
         n_test_samples: int,
+        strategy: str,
         arrival_pattern: str = "poisson",
     ):
         self.arrival_rate = arrival_rate
         self.retrain_rate = retrain_rate
         self.arrival_pattern = arrival_pattern
         self.n_test_samples = n_test_samples 
+        self.strategy = strategy
         self.n_train_samples = int(self.n_test_samples * retrain_rate)
         
 
@@ -32,7 +34,6 @@ class Producer:
         self, 
         tokenizer: AutoTokenizer,
         max_length: int,
-        strategy: str,
         dataset_name: str = "data/Anthropic",
     ) -> List[Task]:
         """
@@ -95,63 +96,102 @@ class Producer:
             load_from_cache_file=False,
         ).remove_columns(train_dataset.column_names)
 
-        # Predefine task priority coefficients
-        coefficients = {
-            "prefill": {"base_priority": -5, "priority_factor": -5e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
-            "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
-            "train": {"base_priority": -2, "priority_factor": -2e-1, "latency_coeff": 9.9e-6, "memory_coeff": 1.5e-4},
-        }
-        if strategy == "sync":
-            # If sync, we always prioritize training tasks
-            coefficients["train"]["base_priority"] = -10000
-
         # Preloaded tasks
         preloaded_tasks: List[Task] = []
-        train_prob = self.retrain_rate / (self.retrain_rate + 1)
-        train_idx, test_idx = 0, 0
-        for taskID in range(self.n_train_samples + self.n_test_samples):
-            if (random.random() < train_prob and train_idx < self.n_train_samples) or (test_idx == self.n_test_samples):
-                # Add a train task
+
+        # We use enqueue time as priority
+        if self.strategy == "train-first":  
+            # Train tasks first, then test tasks
+            for train_idx in range(self.n_train_samples):
                 task = Task(
-                    taskID=taskID,
+                    taskID=train_idx,
                     workload="train", 
                     rate_lambda=self.arrival_rate, 
                     prompt=train_dataset[train_idx]["context"],
                     input_kwargs=processed_train_dataset[train_idx],
-                    coefficients=coefficients,
                 )
-                train_idx += 1
-            else:
-                # Add a test task
+                preloaded_tasks.append(task)
+            for test_idx in range(self.n_test_samples):
                 task = Task(
-                    taskID=taskID,
+                    taskID=test_idx + self.n_train_samples,
                     workload="prefill", 
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[test_idx]["context"],
                     input_kwargs=processed_test_dataset[test_idx],
-                    coefficients=coefficients,
                 )
-                test_idx += 1
+                preloaded_tasks.append(task)
 
-            preloaded_tasks.append(task)
+        # We use enqueue time as priority
+        elif self.strategy == "test-first":  
+            # Test tasks first, then train tasks
+            for test_idx in range(self.n_test_samples):
+                task = Task(
+                    taskID=test_idx,
+                    workload="prefill", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=test_dataset[test_idx]["context"],
+                    input_kwargs=processed_test_dataset[test_idx],
+                )
+                preloaded_tasks.append(task)
+            for train_idx in range(self.n_train_samples):
+                task = Task(
+                    taskID=train_idx + self.n_test_samples,
+                    workload="train", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=train_dataset[train_idx]["context"],
+                    input_kwargs=processed_train_dataset[train_idx],
+                )
+                preloaded_tasks.append(task)
 
-        # print(f"Actually tasks {[task.workload for task in preloaded_tasks]}, train {sum([task.workload == 'train' for task in preloaded_tasks])}, test {sum([task.workload == 'prefill' for task in preloaded_tasks])}")
+        # We use pre-defined coefficients as priority
+        else:  
+            train_prob = self.retrain_rate / (self.retrain_rate + 1)
+            train_idx, test_idx = 0, 0
+            for taskID in range(self.n_train_samples + self.n_test_samples):
+                if (random.random() < train_prob and train_idx < self.n_train_samples) or (test_idx == self.n_test_samples):
+                    # Add a train task
+                    task = Task(
+                        taskID=taskID,
+                        workload="train", 
+                        rate_lambda=self.arrival_rate, 
+                        prompt=train_dataset[train_idx]["context"],
+                        input_kwargs=processed_train_dataset[train_idx],
+                    )
+                    train_idx += 1
+                else:
+                    # Add a test task
+                    task = Task(
+                        taskID=taskID,
+                        workload="prefill", 
+                        rate_lambda=self.arrival_rate, 
+                        prompt=test_dataset[test_idx]["context"],
+                        input_kwargs=processed_test_dataset[test_idx],
+                    )
+                    test_idx += 1
+
+                preloaded_tasks.append(task)
+
         # pdb.set_trace()
         print(f"  **  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  **")
         return preloaded_tasks
     
 
 
-    def produce(self, task_queue: IterQueue, preloaded_tasks: List[Task]):
+    def produce(self, task_queues: List[IterQueue], preloaded_tasks: List[Task]):
 
         # Produce using the dataset
         for taskID, task in enumerate(preloaded_tasks):
-            if task.workload == "train":
-                print(f"  **  Producing task {taskID} ({task.workload})  **  ")
             time.sleep(random.expovariate(task.rate_lambda))
-            # Essentially, we are using preloaded data (task ID)
-            task_queue.put((task.get_priority(initial=True), task.workload, taskID))
-            
-        task_queue.put((float('inf'), None, None))  # Signal the end of the dataset
+            if task.workload == "train":
+                # The first queue is always for retraining tasks
+                print(f"  **  Producing task {taskID} ({task.workload}) **  ")
+                task_queues[0].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
+            else:
+                # The last queue is always for inference tasks
+                task_queues[-1].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
+        
+        for task_queue in task_queues:
+            # Signal the end of the dataset
+            task_queue.put((float('inf'), None, None))  # Signal the end of the dataset
         print("Producer finished producing tasks")
 

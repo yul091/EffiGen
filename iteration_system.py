@@ -2,6 +2,7 @@
 import os
 from typing import List, Optional, Dict, Any
 import time
+import traceback
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, MinLengthLogitsProcessor
@@ -79,11 +80,16 @@ class EffiGenTune:
             arrival_rate=self.arrival_rate, 
             retrain_rate=self.retrain_rate, 
             n_test_samples=self.n_test_samples,
+            strategy=self.strategy,
             arrival_pattern=self.arrival_pattern, 
         )
 
         # Create scheduler
-        self.scheduler = Scheduler(lambda1=args.latency_weight, lambda2=args.memory_weight)
+        self.scheduler = Scheduler(
+            self.strategy, 
+            lambda1=args.latency_weight, 
+            lambda2=args.memory_weight,
+        )
 
         # Get arguments
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
@@ -104,7 +110,7 @@ class EffiGenTune:
 
     def executor(
         self, 
-        task_queue: IterQueue, 
+        task_queues: List[IterQueue], 
         preloaded_tasks: List[Task], 
         record_metrics: Optional[Dict[str, Any]] = None,
     ):
@@ -113,44 +119,108 @@ class EffiGenTune:
         - task_queue (IterQueue): Queue of tasks to be executed.
         - preloaded_tasks (List[Task]): List of preloaded tasks.
         """
-        # iteration = 0
-        # tokens = 0
         record_metrics = record_metrics if record_metrics is not None else {}
         record_metrics["iteration"] = 0
         record_metrics["tokens"] = 0
         
         while True:
-        # while task_queue.qsize() > 0:
-            qsize = task_queue.qsize()
+            qsize = sum(task_queue.qsize() for task_queue in task_queues)
             if qsize == 0:
                 # print("No tasks in the queue. Waiting for tasks...")
                 time.sleep(0.01)
                 continue
-            
-            # tokens += task_queue.qsize()
-            record_metrics["tokens"] += qsize
-            bin, reach_end = self.scheduler.best_fit_allocate(
-                task_queue, 
-                preloaded_tasks, 
-                iteration=record_metrics["iteration"],
-                model=self.model, 
-                attn_implementation=self.attn_implementation,
-                eval_metrics=True,
-                memory_threshold=self.memory_threshold,
-                task_limit=self.task_limit,
-            )
-            
-            bin.concurrent_execute(
-                model=self.model, 
-                tokenizer=self.tokenizer, 
-                task_queue=task_queue, 
-                strategy=self.strategy,
-                optimizer=self.optimizer,
-                **self.bin_kwargs,
-            )
-            # iteration += 1
+                    
+
+            if self.strategy == "async" or self.strategy == "sync": 
+                # For sync or async strategy, we only need to check the first queue
+                bin, reach_end = self.scheduler.best_fit_allocate(
+                    task_queues[0], 
+                    preloaded_tasks, 
+                    iteration=record_metrics["iteration"],
+                    model=self.model, 
+                    attn_implementation=self.attn_implementation,
+                    eval_metrics=True,
+                    memory_threshold=self.memory_threshold,
+                    task_limit=self.task_limit,
+                )
+                if bin is None:
+                    # No suitable bin found, continue to the next iteration
+                    continue
+                record_metrics["tokens"] += bin.get_num_tasks()
+                
+                bin.concurrent_execute(
+                    model=self.model, 
+                    tokenizer=self.tokenizer, 
+                    task_queue=task_queues[0], 
+                    optimizer=self.optimizer,
+                    memory_threshold=self.memory_threshold, 
+                    **self.bin_kwargs,
+                )
+
+            else:
+                # For synchronous strategy, we need to check both queues
+                # pdb.set_trace()
+                try:
+                    if self.strategy == "train-first":
+                        # As long as train_queue is not empty, we schedule train tasks and execute them
+                        if task_queues[0].qsize() == 1 and task_queues[0].queue[-1][-1] is None:
+                            # Training tasks are done, we can check the test queue
+                            task_queue = task_queues[1]
+                        else:
+                            # Training tasks are still available, we continue checking the training queue
+                            task_queue = task_queues[0]
+                    elif self.strategy == "test-first":
+                        # As long as test_queue is not empty, we schedule test tasks and execute them
+                        if task_queues[1].qsize() == 1 and task_queues[1].queue[-1][-1] is None:
+                            # Inference tasks are done, we can check the train queue
+                            task_queue = task_queues[0]
+                        else:
+                            # Inference tasks are still available, we continue checking the inference queue
+                            task_queue = task_queues[1]
+
+                except Exception as e:
+                    print(f"Error during task queue indexing: {e}")
+                    continue
+                
+                try:
+                    # pdb.set_trace()
+                    bin, reach_end = self.scheduler.best_fit_allocate(
+                        task_queue, 
+                        preloaded_tasks, 
+                        iteration=record_metrics["iteration"],
+                        model=self.model, 
+                        attn_implementation=self.attn_implementation,
+                        eval_metrics=True,
+                        memory_threshold=self.memory_threshold,
+                        task_limit=self.task_limit,
+                    )
+                except Exception as e:
+                    print(f"Error during task scheduling: {e}")
+                    traceback.print_exc()
+                    continue
+                
+                try:
+                    # pdb.set_trace()
+                    if bin is None:
+                        # No suitable bin found, continue to the next iteration
+                        continue
+                    record_metrics["tokens"] += bin.get_num_tasks()
+
+                    bin.concurrent_execute(
+                        model=self.model, 
+                        tokenizer=self.tokenizer, 
+                        task_queue=task_queue, 
+                        optimizer=self.optimizer,
+                        memory_threshold=self.memory_threshold, 
+                        **self.bin_kwargs,
+                    )
+                except Exception as e:
+                    print(f"Error during task execution: {e}")
+                    continue
+
             record_metrics["iteration"] += 1
-            if reach_end and task_queue.qsize() == 1:  # 1 because we always put back the end signal
+            if reach_end and all((task_queue.qsize() == 1 and task_queue.queue[-1][-1] is None) for task_queue in task_queues): 
+                # Because we always put back the end signal for each queue
                 print("Executor reached the end of the preloaded tasks.")
                 break
 
@@ -164,7 +234,6 @@ class EffiGenTune:
         Run the system with the given tasks.
         - preloaded_tasks (List[Task]): List of preloaded tasks.
         """
-
         def start_priority_refresher(task_queue: IterQueue, preloaded_tasks: List[Task], interval: float = 1.0):
             def refresher_loop():
                 while True:
@@ -172,7 +241,7 @@ class EffiGenTune:
                         for i, (priority, workload, taskID) in enumerate(task_queue.queue):
                             if taskID is not None:
                                 task = preloaded_tasks[taskID]
-                                new_priority = task.get_priority(initial=False)
+                                new_priority = task.get_priority(self.strategy, initial=False)
                                 task_queue.queue[i] = (new_priority, workload, taskID)
                         heapify(task_queue.queue)
                     # Print the task queue for debugging
@@ -181,7 +250,7 @@ class EffiGenTune:
 
             thread = threading.Thread(target=refresher_loop, daemon=True)
             thread.start()
-            return thread
+            # return thread
 
 
         # Get preloaded tasks
@@ -189,25 +258,32 @@ class EffiGenTune:
             preloaded_tasks = self.producer.load_dataset(
                 tokenizer=self.tokenizer,
                 max_length=self.max_context_length,
-                strategy=self.strategy,
                 dataset_name=self.data_path,
             )
 
         # Create iteration bin and execute tasks
-        task_queue = IterQueue()
+        if self.strategy == "async" or self.strategy == "sync":
+            task_queues = [IterQueue()]
+        else:
+            # Maintain two queues, first is for retraining, second is for inference
+            task_queues = [IterQueue(), IterQueue()]
+            
+
         record_metrics = {}
         start = time.time()
 
-        # ✅ Start background refresher
-        self.refresher_thread = start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
+        # ✅ Start background refresher (if strategy is async or sync)
+        if self.strategy == "async":
+            for task_queue in task_queues:
+                start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Start the producer in a separate thread
-            executor.submit(self.producer.produce, task_queue, preloaded_tasks)
+            executor.submit(self.producer.produce, task_queues, preloaded_tasks)
 
             # Start the executor in main thread
             # self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
-            executor.submit(self.executor, task_queue, preloaded_tasks, record_metrics=record_metrics)
+            executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
 
         end = time.time()
         print(f"Total time: {end - start}, throughput: {record_metrics['tokens'] / (end - start)} tokens/sec")
@@ -237,7 +313,7 @@ class EffiGenTune:
                     "metrics": task.metrics,
                     "release_time": task.release_time,
                     "execution_time": task.execution_time,
-                    "priority": task.priority,
+                    "priority": task.get_priority(self.strategy, initial=False),
                 }
                 for task in preloaded_tasks
             ],
@@ -285,7 +361,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0, help="GPU device number")
-    parser.add_argument("--strategy", type=str, default="sync", choices=["async", "sync"], help="Scheduling strategy")
+    parser.add_argument("--strategy", type=str, default="sync", choices=["async", "sync", "train-first", "test-first"], help="Scheduling strategy")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", choices=["flash_attention_2", "eager"], help="Attention implementation")
     parser.add_argument("--model_path", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", help="Path to the model")
     parser.add_argument("--data_path", type=str, default="data/Anthropic", help="Path to the dataset")
@@ -307,170 +383,5 @@ if __name__ == "__main__":
     system.run()
 
     
-    # random.seed(42)
-    # # Verify the number of available CUDA devices
-    # device = args.device
-    # strategy = args.strategy  # "async" or "sync"
-    # attn_implementation = args.attn_implementation  # "flash_attention_2" or "eager"
-    # model_path = args.model_path
-    # n_test_samples = args.n_test_samples
-    # n_train_samples = int(n_test_samples * args.retrain_rate)
-    # lr = args.lr
-    # data_path = args.data_path
-    # arrival_rate = args.arrival_rate
-
-    # tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left", use_fast=True)
-    # if tokenizer.pad_token is None:
-    #     tokenizer.pad_token = tokenizer.eos_token
-    #     tokenizer.pad_token_id = tokenizer.eos_token_id
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     model_path,
-    #     low_cpu_mem_usage=True,
-    #     torch_dtype=torch.float16,
-    #     device_map={"": device},
-    #     use_cache=True,
-    #     attn_implementation=attn_implementation,
-    # )
-    # # Apply LoRA configuration
-    # lora_config = LoraConfig(
-    #     r=16,  # LoRA rank
-    #     lora_alpha=16,  # Scaling factor
-    #     target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
-    #     lora_dropout=0.05,
-    #     task_type="CAUSAL_LM",
-    #     bias="none",
-    # )
-    # # Wrap model with LoRA
-    # model = get_peft_model(model, lora_config)
-    # model.print_trainable_parameters()  # Should list LoRA parameters as trainable
-    # max_length = model.config.max_position_embeddings
-    # model.generation_config.pad_token_id = tokenizer.pad_token_id
-    # # Get optimizer
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-    # # Define batch tokenization
-    # def tokenize_and_align_labels(examples):
-    #     """Tokenizes inputs in batch and masks out context for chosen labels."""
-    #     contexts = examples["context"]
-    #     chosens = examples["chosen_response"]
-    #     rejecteds = examples["rejected_response"]
-
-    #     # Tokenize all inputs in batch mode
-    #     chosen_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, chosens)],
-    #                                 truncation=True, padding=False,  # Use dynamic padding later during collation
-    #                                 max_length=max_length)
-        
-    #     rejected_encodings = tokenizer([c + "\n\n" + r for c, r in zip(contexts, rejecteds)],
-    #                                 truncation=True, padding=False,  # Use dynamic padding later during collation
-    #                                 max_length=max_length)
-
-    #     # Tokenize context separately (to get its length)
-    #     context_encodings = tokenizer(contexts, truncation=True, padding=False, max_length=max_length)
-    #     context_lengths = [len(enc) for enc in context_encodings["input_ids"]]
-
-    #     # Create labels: Mask out context tokens by setting them to `-100`
-    #     chosen_labels = [
-    #         [-100] * ctx_len + chosen_encodings["input_ids"][i][ctx_len:]
-    #         for i, ctx_len in enumerate(context_lengths)
-    #     ]
-
-    #     return {
-    #         "context_input_ids": context_encodings["input_ids"],
-    #         "context_attention_mask": context_encodings["attention_mask"],
-    #         "chosen_input_ids": chosen_encodings["input_ids"],
-    #         "chosen_attention_mask": chosen_encodings["attention_mask"],
-    #         "chosen_labels": chosen_labels,
-    #         "rejected_input_ids": rejected_encodings["input_ids"],
-    #         "rejected_attention_mask": rejected_encodings["attention_mask"],
-    #     }
-
-    # # Load dataset 
-    # rlhf_data = load_dataset(data_path)
-    # test_indices = random.sample(range(len(rlhf_data["test"])), n_test_samples)
-    # test_dataset = rlhf_data["test"].select(test_indices)
-    # train_indices = random.sample(range(len(rlhf_data["train"])), n_train_samples)
-    # train_dataset = rlhf_data["train"].select(train_indices)
-    # processed_test_dataset = test_dataset.map(
-    #     tokenize_and_align_labels,
-    #     batched=True,
-    #     load_from_cache_file=False,
-    # ).remove_columns(test_dataset.column_names)
-    # processed_train_dataset = train_dataset.map(
-    #     tokenize_and_align_labels, 
-    #     batched=True, 
-    #     load_from_cache_file=False,
-    # ).remove_columns(train_dataset.column_names)  
-  
-    # # Preloaded tasks
-    # preloaded_tasks: List[Task] = []
-    # for i, test_example in enumerate(processed_test_dataset):
-    #     task = Task(
-    #         taskID=i,
-    #         workload="prefill", 
-    #         rate_lambda=arrival_rate, 
-    #         prompt=test_dataset[i]["context"],
-    #         input_kwargs=test_example,
-    #     )
-    #     preloaded_tasks.append(task)
-        
-    # accum = i+1
-    # for j, train_example in enumerate(processed_train_dataset):
-    #     task = Task(
-    #         taskID=accum+j,
-    #         workload="train", 
-    #         rate_lambda=arrival_rate, 
-    #         prompt=train_dataset[j]["context"],
-    #         input_kwargs=train_example,
-    #     )
-    #     preloaded_tasks.append(task)
-
-    # # Simulate global scheduler
-    # task_queue = PriorityQueue()
-    # for taskID, task in enumerate(preloaded_tasks):
-    #     task_queue.put((task.get_priority(initial=True), taskID))
-
-    # # Create iteration bin and execute tasks
-    # start = time.time()
-    # scheduler = Scheduler(lambda1=0.5, lambda2=0.5)
-    # iteration = 0
-    # tokens = 0
-    # while task_queue.qsize() > 0:
-    #     print(f"  **  Iteration {iteration} (queue size {task_queue.qsize()})  **  ")
-    #     tokens += task_queue.qsize()
-    #     # while task_queue.qsize() > 0:
-    #     #     _, taskID = task_queue.get(timeout=0.5)
-    #     #     bin.add_task(preloaded_tasks[taskID])
-    #     bin = scheduler.best_fit_allocate(task_queue, preloaded_tasks, model, attn_implementation=attn_implementation, eval_metrics=True)
-    #     print(f"\tBin allocation (prefill {len(bin.prefill_batch)}, decode {len(bin.decode_batch)}, train {len(bin.train_batch)})")
-    #     bin.concurrent_execute(model, tokenizer, task_queue, strategy=strategy, optimizer=optimizer)
-    #     iteration += 1
-    #     # break
-        
-    # end = time.time()
-
-    # print(f"Completed in {iteration} iterations! Total time: {end - start}, throughput: {tokens / (end - start)} tokens/sec")
-
-    # # Save the task's prompt and response to a file
-    # output_dir = "profile_main/dummy/Mistral-7B-Instruct-v0.2"
-    # os.makedirs(output_dir, exist_ok=True)
-    # output_file = os.path.join(output_dir, f"output_cache_{strategy}_system.json")
-    # metrics = {
-    #     "iteration": iteration,
-    #     "total_time": end - start,
-    #     "throughput": tokens / (end - start),
-    #     "generation_results": [
-    #         {
-    #             "taskID": task.taskID,
-    #             "workload": task.workload,
-    #             "prompt": task.prompt,
-    #             "response": task.response,
-    #             "step": task.step,
-    #             "metrics": task.metrics,
-    #         }
-    #         for task in preloaded_tasks
-    #     ],
-    # }
-    # save_metrics_with_order(metrics, output_file)
-    # print(f"Metrics saved to {output_file}")
 
     

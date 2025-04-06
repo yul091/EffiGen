@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any, Callable
 import time
 import torch
 import torch.nn as nn
+from line_profiler import profile
 from transformers import (
     LlamaTokenizer,
     LlamaForCausalLM,
@@ -19,13 +20,14 @@ from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task
 from iteration_queue import IterQueue
 from alignment_study import DPOCollator, dpo_loss, compute_batch_metrics
-from utils import prepare_inputs
+from utils import prepare_inputs, _prepare_input
 
 
 class Bin:
 
     def __init__(
         self,
+        strategy: str,
         device: int = 0,
         inference_input_feature: str = "input_ids",
         inference_mask_feature: str = "attention_mask",
@@ -37,14 +39,26 @@ class Bin:
         self.decode_batch: List[Task] = []
         self.train_batch: List[Task] = []
         self.eval_metrics = eval_metrics
+        self.device = device
+        self.strategy = strategy
         # Initialize memory and latency
         self.memory_capacity = torch.cuda.get_device_properties(device).total_memory / (1024**2)  # MB
-        self.total_memory = torch.cuda.max_memory_allocated(device) / (1024**2)  # MB
+        self.base_memory = torch.cuda.memory_allocated(device) / (1024**2)  # MB
         self.max_latency = 0
-        self.free_memory = self.memory_capacity
+        self.workload_stats = {
+            "train": {"max_length": 1, "memory": 0, "batch_size": 0, "latency": 0,},
+            "prefill": {"max_length": 1, "memory": 0, "batch_size": 0, "latency": 0,},
+            "decode": {"max_length": 1, "memory": 0, "batch_size": 0, "latency": 0,},
+        }
         
 
-    def add_task(self, task: Task):
+    def add_task(
+        self, 
+        task: Task,
+        model: LlamaForCausalLM,
+        attn_implementation: str = "flash_attention_2", 
+        new_seq_length: Optional[int] = None,
+    ):
         if task.workload == "prefill":
             self.prefill_batch.append(task)
         elif task.workload == "decode":
@@ -52,34 +66,77 @@ class Bin:
         elif task.workload == "train":
             self.train_batch.append(task)
         else:
-            # self.test_batch.append(task)
             raise ValueError(f"Invalid workload: {task.workload}")
+        
+        # Update the workload stats
+        batch_memory, batch_latency, batch_length, _, _ = self.get_workload(
+            task, model, attn_implementation, new_seq_length=new_seq_length,
+        )
+        self.workload_stats[task.workload]["batch_size"] += 1
+        self.workload_stats[task.workload]["max_length"] = batch_length
+        self.workload_stats[task.workload]["memory"] = batch_memory
+        self.workload_stats[task.workload]["latency"] = batch_latency
+        self.max_latency = max(self.max_latency, batch_latency)
+        
         
 
     def get_num_tasks(self) -> int:
         return len(self.prefill_batch) + len(self.decode_batch) + len(self.train_batch)
         
 
-    def update_workload(self, operation: str = "add", memory: float = 0, latency: float = 0):
+    def get_workload(
+        self, 
+        task: Task, 
+        model: LlamaForCausalLM,
+        attn_implementation: str = "flash_attention_2", 
+        new_seq_length: Optional[int] = None,
+    ):
         """
-        Estimate the resource consumption of all workloads in the bin. Update the free memory and max latency.
+        Estimate the resource consumption of all workloads in the bin. 
+        Return the maximum new length, batch memory and latency.
         """
-        if operation == "add":
-            # Calculate the total memory used by the tasks in the bin
-            # memory, latency = task.get_workload()
-            self.total_memory += memory
-            self.max_latency = max(self.max_latency, latency)
-            if self.free_memory < memory:
-                logging.warning(f"Memory overflow! Preallocate: {self.total_memory} MB, capacity: {self.memory_capacity} MB")
-            self.free_memory = max(self.memory_capacity - self.total_memory, 0)
-        elif operation == "clear":
-            self.total_memory = 0
-            self.max_latency = 0
-            self.free_memory = self.memory_capacity
+        # Calculate the total memory used by the tasks in the bin
+        basic_factor = model.model.config.num_hidden_layers * model.model.config.hidden_size  # num_layers * hidden_dim
+        if new_seq_length is None:
+            new_seq_length = task.get_input_length()
+        batch_length = max(self.workload_stats[task.workload]["max_length"], new_seq_length)
+        # Calculate the memory and latency for the task
+        length_multiplier = batch_length if attn_implementation == "flash_attention_2" else batch_length**2
+        new_batch_size = self.workload_stats[task.workload]["batch_size"] + 1
+        batch_memory = basic_factor * new_batch_size * length_multiplier * task.coefficients[task.workload]["memory_coeff"]
+        batch_latency = basic_factor * new_batch_size * length_multiplier * task.coefficients[task.workload]["latency_coeff"]
+        # accumulated_memory = sum(self.workload_stats[w]['memory'] for w in self.workload_stats if w != task.workload) + batch_memory
+        accumulated_memory = batch_memory
+        if self.strategy == "async":
+            # Asynchronous execution, so we count all workloads
+            accumulated_memory += sum(self.workload_stats[w]['memory'] for w in self.workload_stats if w != task.workload)
         else:
-            raise ValueError(f"Invalid operation: {operation}. Choose 'add' or 'clear'.")
+            # Training workload is independently executed, so we only count the batch memory
+            # Prefill workload is co-executed with decode workload
+            if task.workload == "prefill":  
+                accumulated_memory += self.workload_stats["decode"]["memory"]
+            elif task.workload == "decode":  
+                accumulated_memory += self.workload_stats["prefill"]["memory"]
+            
+        memory_fit = max(self.memory_capacity - accumulated_memory - self.base_memory, 0)
+        max_latency = max(self.max_latency, batch_latency)
+        latency_fit = max_latency - batch_latency
+        return batch_memory, batch_latency, batch_length, memory_fit, latency_fit
+        
+        # Update the bin stats
+        # self.total_memory = self.base_memory + accumulated_memory
+        # self.max_latency = max(self.max_latency, latency)
+        # if self.free_memory < memory:
+        #     logging.warning(f"Memory overflow! Preallocate: {self.total_memory} MB, capacity: {self.memory_capacity} MB")
+        # self.free_memory = max(self.memory_capacity - self.total_memory, 0)
+        # elif operation == "clear":
+        #     self.total_memory = self.base_memory
+        #     self.max_latency = 0
+        #     self.free_memory = self.memory_capacity - self.base_memory
+        # else:
+        #     raise ValueError(f"Invalid operation: {operation}. Choose 'add' or 'clear'.")
 
-
+    @profile
     def _create_batch(
         self,
         batch: List[Task],
@@ -129,7 +186,7 @@ class Bin:
 
         return prepare_inputs(inputs, device=device)
     
-
+    @profile
     def _batch_decoding(
         self,
         batch: List[Task],
@@ -178,20 +235,25 @@ class Bin:
                 for layer_idx in range(len(past_key_values.key_cache)):
                     task.past_key_values.update(
                         past_key_values.key_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
-                        past_key_values.value_cache[layer_idx][i, :, mask, :],
+                        past_key_values.value_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
                         layer_idx=layer_idx,
                     )
+                    # task.past_key_values.update(
+                    #     past_key_values.key_cache[layer_idx][i, :, mask, :].cpu(),  # [H, S_valid, D]
+                    #     past_key_values.value_cache[layer_idx][i, :, mask, :].cpu(),  # [H, S_valid, D]
+                    #     layer_idx=layer_idx,
+                    # )
                 # print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
                 # Add task back to queue
-                task_queue.put((task.get_priority(initial=False), task.workload, task.taskID))
+                task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
             else:  # stop decoding
                 # Update response (text) with next token
                 task.get_response(tokenizer)
                 # Empty cache
-                task.past_key_values = None
+                del task.past_key_values
                 
 
-
+    @profile
     def execute(
         self,
         batch: List[Task],
@@ -204,11 +266,27 @@ class Bin:
         logits_processor: Optional[LogitsProcessorList] = None,
         max_new_tokens: Optional[int] = None,
         generation_config: Optional[Dict[str, Any]] = None,
+        memory_threshold: Optional[float] = None,
     ):
         if not batch:
             return 
         
         inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
+        memory_threshold = memory_threshold if memory_threshold is not None else 0.95
+        
+        # Check memory threshold
+        preallocated_memory = torch.cuda.memory_allocated(model.device) / (1024**2)  # MB
+        if preallocated_memory > memory_threshold * self.memory_capacity:
+            logging.warning(f"Memory overflow! Preallocate: {preallocated_memory:.2f} MB, capacity: {self.memory_capacity:.2f} MB")
+            for task in batch:
+                # Offload the cache to CPU
+                task.past_key_values = _prepare_input(task.past_key_values, device="cpu")
+                # Update task status and put it back to the queue
+                task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
+            # Clear the batch
+            batch.clear()
+            return
+        
         execution_time = time.time()
         try:
             if workload == "train":
@@ -271,9 +349,11 @@ class Bin:
                     max_new_tokens=max_new_tokens,
                     past_key_values=outputs.past_key_values,
                 ) 
-                
+
+                del outputs, inputs, model_kwargs, model_inputs
+
         except Exception as e:
-            logging.error(f"Error during {workload} execution: {e}")
+            logging.error(f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}")
             for task in batch:
                 task.execution_time = execution_time
                 task.response = "Error occurred during execution."
@@ -281,8 +361,8 @@ class Bin:
 
         # Clear the batch
         batch.clear()
-        gc.collect()
-        torch.cuda.empty_cache()
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
 
     def concurrent_execute(
@@ -290,22 +370,11 @@ class Bin:
         model: LlamaForCausalLM,
         tokenizer: LlamaTokenizer,
         task_queue: IterQueue,
-        strategy: str,
         optimizer: torch.optim.Optimizer,
+        memory_threshold: Optional[float] = None,
         **kwargs,
     ):
-        if strategy == "sync":
-            # print(f"Sequantial execution (prioritize training)!")
-            # Prioritize the training workload
-            if self.train_batch:
-                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, **kwargs)
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                for workload, batch in [
-                    ("prefill", self.prefill_batch),
-                    ("decode", self.decode_batch),
-                ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
-        elif strategy == "async":
+        if self.strategy == "async":
             with ThreadPoolExecutor(max_workers=3) as executor:
                 # print(f"Concurrent execution (prioritize inference)!")
                 for workload, batch in [
@@ -313,12 +382,29 @@ class Bin:
                     ("prefill", self.prefill_batch),
                     ("decode", self.decode_batch),
                 ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, **kwargs)
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+
         else:
-            raise ValueError(f"Unknown strategy: {strategy}. Choose 'sync' or 'async'.")
-
-    
-
+            # print(f"Sequantial execution (prioritize training)!")
+            # Prioritize the training workload
+            if self.strategy == "train-first" or self.strategy == "sync":
+                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    for workload, batch in [
+                        ("prefill", self.prefill_batch),
+                        ("decode", self.decode_batch),
+                    ]:
+                        executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            elif self.strategy == "test-first":
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    for workload, batch in [
+                        ("prefill", self.prefill_batch),
+                        ("decode", self.decode_batch),
+                    ]:
+                        executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            else:
+                raise ValueError(f"Invalid strategy: {self.strategy}. Supported strategies: train-first, test-first, async, sync.")
 
 
     

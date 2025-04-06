@@ -3,13 +3,15 @@ from typing import List, Tuple, Optional
 from transformers import AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
+import torch
 from iteration_task import Task  
 from iteration_bin import Bin
 from iteration_queue import IterQueue
 
 
 class Scheduler:
-    def __init__(self, lambda1: float = 0.5, lambda2: float = 0.5):
+    def __init__(self, strategy: str, lambda1: float = 0.5, lambda2: float = 0.5):
+        self.strategy = strategy
         self.lambda1 = lambda1
         self.lambda2 = lambda2
     
@@ -19,6 +21,12 @@ class Scheduler:
     #     """
     #     return task.get_workload()
 
+    def memory_saturation(self, bin: Bin, memory_threshold: float) -> bool:
+        """
+        Check if the bin is saturated with memory.
+        """
+        return torch.cuda.memory_allocated(bin.device) / (1024**2) / bin.memory_capacity > memory_threshold
+
     def best_fit_allocate(
         self, 
         task_queue: IterQueue, 
@@ -27,18 +35,19 @@ class Scheduler:
         model: AutoModelForCausalLM,
         attn_implementation: str = "flash_attention_2",
         eval_metrics: bool = False,
-        memory_threshold: Optional[float] = 0.95,
-        task_limit: Optional[int] = 50,
+        memory_threshold: float = 0.95,
+        task_limit: int = 50,
     ) -> Tuple[Bin, bool]:
         """
         Priority-aware best-fit bin packing considering both memory & latency.
         """
+        # print(f"  **  [Iteration {iteration}] Start scheduling tasks with memory threshold {memory_threshold:.2f}...  **")
         bins: List[Bin] = []
         reach_end = False
         initial_qsize, itrain, iprefill, idecode = task_queue.qsize(), task_queue.train_size, task_queue.prefill_size, task_queue.decode_size
         task_count, strain, sprefill, sdecode = 0, 0, 0, 0
         while task_queue.qsize() > 0:
-            if bins and bins[0].total_memory >= memory_threshold * bins[0].memory_capacity or task_count >= task_limit:
+            if task_count >= task_limit or (bins and self.memory_saturation(bins[0], memory_threshold)):
                 break
             _, _, taskID = task_queue.get()  # priority, workload, taskID
             if taskID is None:
@@ -46,7 +55,7 @@ class Scheduler:
                 task_queue.put((float('inf'), None, None))  # Put back the end signal since we may have unfinished decoding tasks
                 reach_end = True
                 break
-
+            # print(f"  ** [Task {taskID}] - total preloaded tasks {len(preloaded_tasks)}...  **")
             task: Task = preloaded_tasks[taskID]
             task_count += 1
             if task.workload == "train":
@@ -56,28 +65,24 @@ class Scheduler:
             elif task.workload == "decode":
                 sdecode += 1
             best_bin, best_score = None, float('inf')
-            # Get task workload anticipation
-            memory, latency = task.get_workload(model, attn_implementation=attn_implementation)
 
-            for bin in bins:
+            for idx, bin in enumerate(bins):
                 # Check if the bin can accommodate the task
-                if bin.free_memory >= memory:
-                    memory_fit = abs(bin.free_memory - memory)
-                    latency_fit = abs(bin.max_latency - latency)
+                _, _, _, memory_fit, latency_fit = bin.get_workload(task, model, attn_implementation=attn_implementation)
+                # print(f"  **  [Iteration {iteration} - Scheduling task {taskID} ({task.workload})] - (seq_len {batch_length}, memory {batch_memory:.2f}, latency {batch_latency:.2f}) - bin {idx} (base memory {bin.base_memory:.2f}, memory capacity {bin.memory_capacity}, max latency {bin.max_latency:.2f}, workload stats {bin.workload_stats}) - memory fit {memory_fit:.2f} / latency fit {latency_fit:.2f}  **")
+                if memory_fit > 0:
                     score = self.lambda1 * memory_fit + self.lambda2 * latency_fit
                     if score < best_score:
                         best_bin = bin
                         best_score = score
 
             if best_bin is not None:
-                best_bin.add_task(task)
-                best_bin.update_workload(operation="add", memory=memory, latency=latency)
+                best_bin.add_task(task, model, attn_implementation=attn_implementation)
                 # print(f" - Task {taskID} ({task.workload}) is assigned to bin {bins.index(best_bin)} (with accum memory {best_bin.total_memory} and max latency {best_bin.max_latency})")
             else:  
                 # current bins are exhausted
-                new_bin = Bin(device=model.device, eval_metrics=eval_metrics)
-                new_bin.add_task(task)
-                new_bin.update_workload(operation="add", memory=memory, latency=latency)
+                new_bin = Bin(self.strategy, device=model.device, eval_metrics=eval_metrics)
+                new_bin.add_task(task, model, attn_implementation=attn_implementation)
                 bins.append(new_bin)
                 # print(f" - Task {taskID} ({task.workload}) is assigned to bin {bins.index(new_bin)} (with accum memory {new_bin.total_memory} and max latency {new_bin.max_latency})")
 
@@ -87,7 +92,7 @@ class Scheduler:
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
-                    task_queue.put((task.get_priority(initial=False), task.workload, task.taskID))
+                    task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
 
         # Return the next bin for execution
         return bins[0] if bins else None, reach_end

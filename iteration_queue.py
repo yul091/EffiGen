@@ -93,7 +93,7 @@ class IterQueue(Queue):
 #                     for i, (priority, workload, taskID) in enumerate(task_queue.queue):
 #                         if taskID is not None:
 #                             task = preloaded_tasks[taskID]
-#                             new_priority = task.get_priority(initial=False)
+#                             new_priority = task.get_priority(strategy, initial=False)
 #                             task_queue.queue[i] = (new_priority, workload, taskID)
 #                     heapify(task_queue.queue)
 #                 # Print the task queue for debugging
