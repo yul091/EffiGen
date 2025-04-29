@@ -143,6 +143,37 @@ class Producer:
                 )
                 preloaded_tasks.append(task)
 
+        # We use enqueue time as priority
+        elif self.strategy == "train-middle":  # split the test into halves, test - train - test
+            # Train tasks in the middle
+            for test_idx in range(self.n_test_samples // 2):
+                task = Task(
+                    taskID=test_idx,
+                    workload="prefill", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=test_dataset[test_idx]["context"],
+                    input_kwargs=processed_test_dataset[test_idx],
+                )
+                preloaded_tasks.append(task)
+            for train_idx in range(self.n_train_samples):
+                task = Task(
+                    taskID=train_idx + test_idx + 1,
+                    workload="train", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=train_dataset[train_idx]["context"],
+                    input_kwargs=processed_train_dataset[train_idx],
+                )
+                preloaded_tasks.append(task)
+            for second_test_idx in range(test_idx + 1, self.n_test_samples):
+                task = Task(
+                    taskID=second_test_idx + train_idx + 1,
+                    workload="prefill", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=test_dataset[second_test_idx]["context"],
+                    input_kwargs=processed_test_dataset[second_test_idx],
+                )
+                preloaded_tasks.append(task)
+
         # We use pre-defined coefficients as priority
         else:  
             train_prob = self.retrain_rate / (self.retrain_rate + 1)

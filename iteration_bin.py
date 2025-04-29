@@ -14,11 +14,13 @@ from transformers import (
     LlamaForCausalLM,
     LogitsProcessorList, 
     MinLengthLogitsProcessor,
+    GenerationConfig,
 )
 from transformers.cache_utils import DynamicCache, Cache
 from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task
 from iteration_queue import IterQueue
+from iteration_lora_selection import selective_training
 from alignment_study import DPOCollator, dpo_loss, compute_batch_metrics
 from utils import prepare_inputs, _prepare_input
 
@@ -265,11 +267,17 @@ class Bin:
         batch_collator: Optional[DPOCollator] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
         max_new_tokens: Optional[int] = None,
-        generation_config: Optional[Dict[str, Any]] = None,
+        generation_config: Optional[GenerationConfig] = None,
         memory_threshold: Optional[float] = None,
+        loss_threshold: Optional[float] = None,
+        layer_selection: Optional[str] = None,  # "RGN" or "SNR" or None
+        layer_threshold: Optional[float] = None,
     ):
         if not batch:
             return 
+        
+        # # Print all the arguments
+        # print(f"\nmax_new_tokens: {max_new_tokens}, memory_threshold: {memory_threshold}, loss_threshold: {loss_threshold}, layer_selection: {layer_selection}, layer_threshold: {layer_threshold}\n")
         
         inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
         memory_threshold = memory_threshold if memory_threshold is not None else 0.95
@@ -293,8 +301,21 @@ class Bin:
                 model.train()
                 optimizer.zero_grad()
                 losses = dpo_loss(model, inputs, return_average=False)
-                losses.mean().backward()
-                optimizer.step()
+                
+                # Handle selective training
+                if layer_selection is not None:
+                    losses = selective_training(
+                        model=model,
+                        losses=losses,
+                        loss_threshold=loss_threshold,
+                        layer_selection=layer_selection,
+                        layer_threshold=layer_threshold,
+                        optimizer=optimizer,
+                    )
+                else:
+                    losses.mean().backward()
+                    optimizer.step()
+
                 # Update task status
                 for i, task in enumerate(batch):
                     task.metrics["loss"] = losses[i].item()
@@ -387,24 +408,32 @@ class Bin:
         else:
             # print(f"Sequantial execution (prioritize training)!")
             # Prioritize the training workload
-            if self.strategy == "train-first" or self.strategy == "sync":
-                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    for workload, batch in [
-                        ("prefill", self.prefill_batch),
-                        ("decode", self.decode_batch),
-                    ]:
-                        executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
-            elif self.strategy == "test-first":
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    for workload, batch in [
-                        ("prefill", self.prefill_batch),
-                        ("decode", self.decode_batch),
-                    ]:
-                        executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
-                self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
-            else:
-                raise ValueError(f"Invalid strategy: {self.strategy}. Supported strategies: train-first, test-first, async, sync.")
+            self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                for workload, batch in [
+                    ("prefill", self.prefill_batch),
+                    ("decode", self.decode_batch),
+                ]:
+                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+
+            # if self.strategy == "train-first" or self.strategy == "sync":
+            #     self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #     with ThreadPoolExecutor(max_workers=2) as executor:
+            #         for workload, batch in [
+            #             ("prefill", self.prefill_batch),
+            #             ("decode", self.decode_batch),
+            #         ]:
+            #             executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            # elif self.strategy == "test-first":
+            #     with ThreadPoolExecutor(max_workers=2) as executor:
+            #         for workload, batch in [
+            #             ("prefill", self.prefill_batch),
+            #             ("decode", self.decode_batch),
+            #         ]:
+            #             executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #     self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            # else:
+            #     raise ValueError(f"Invalid strategy: {self.strategy}. Supported strategies: train-first, test-first, async, sync.")
 
 
     

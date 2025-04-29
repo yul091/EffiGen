@@ -45,6 +45,9 @@ class EffiGenTune:
         self.max_new_tokens = args.max_new_tokens
         self.memory_threshold = args.memory_threshold
         self.task_limit = args.task_limit
+        self.loss_threshold = args.loss_threshold
+        self.layer_selection = args.layer_selection
+        self.layer_threshold = args.layer_threshold
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, padding_side="left", use_fast=True)
@@ -94,7 +97,7 @@ class EffiGenTune:
         # Get arguments
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
  
-        self.bin_kwargs = {
+        self.kwargs = {
             "max_new_tokens": self.max_new_tokens,
             "logits_processor": LogitsProcessorList([
                 MinLengthLogitsProcessor(1, eos_token_id=self.tokenizer.eos_token_id, device=self.device),
@@ -105,6 +108,9 @@ class EffiGenTune:
                 inference_mask_feature="attention_mask",
             ),
             "generation_config": None,
+            "loss_threshold": self.loss_threshold,
+            "layer_selection": self.layer_selection,
+            "layer_threshold": self.layer_threshold,
         }
 
 
@@ -129,94 +135,118 @@ class EffiGenTune:
                 # print("No tasks in the queue. Waiting for tasks...")
                 time.sleep(0.01)
                 continue
-                    
-
-            if self.strategy == "async" or self.strategy == "sync": 
-                # For sync or async strategy, we only need to check the first queue
-                bin, reach_end = self.scheduler.best_fit_allocate(
-                    task_queues[0], 
-                    preloaded_tasks, 
-                    iteration=record_metrics["iteration"],
-                    model=self.model, 
-                    attn_implementation=self.attn_implementation,
-                    eval_metrics=True,
-                    memory_threshold=self.memory_threshold,
-                    task_limit=self.task_limit,
-                )
-                if bin is None:
-                    # No suitable bin found, continue to the next iteration
-                    continue
-                record_metrics["tokens"] += bin.get_num_tasks()
                 
-                bin.concurrent_execute(
-                    model=self.model, 
-                    tokenizer=self.tokenizer, 
-                    task_queue=task_queues[0], 
-                    optimizer=self.optimizer,
-                    memory_threshold=self.memory_threshold, 
-                    **self.bin_kwargs,
-                )
+            # For sync or async strategy, we only need to check the first queue
+            bin, reach_end = self.scheduler.best_fit_allocate(
+                task_queues[0], 
+                preloaded_tasks, 
+                iteration=record_metrics["iteration"],
+                model=self.model, 
+                attn_implementation=self.attn_implementation,
+                eval_metrics=True,
+                memory_threshold=self.memory_threshold,
+                task_limit=self.task_limit,
+            )
+            if bin is None:
+                # No suitable bin found, continue to the next iteration
+                continue
+            record_metrics["tokens"] += bin.get_num_tasks()
+            
+            bin.concurrent_execute(
+                model=self.model, 
+                tokenizer=self.tokenizer, 
+                task_queue=task_queues[0], 
+                optimizer=self.optimizer,
+                memory_threshold=self.memory_threshold, 
+                **self.kwargs,
+            )
 
-            else:
-                # For synchronous strategy, we need to check both queues
-                # pdb.set_trace()
-                try:
-                    if self.strategy == "train-first":
-                        # As long as train_queue is not empty, we schedule train tasks and execute them
-                        if task_queues[0].qsize() == 1 and task_queues[0].queue[-1][-1] is None:
-                            # Training tasks are done, we can check the test queue
-                            task_queue = task_queues[1]
-                        else:
-                            # Training tasks are still available, we continue checking the training queue
-                            task_queue = task_queues[0]
-                    elif self.strategy == "test-first":
-                        # As long as test_queue is not empty, we schedule test tasks and execute them
-                        if task_queues[1].qsize() == 1 and task_queues[1].queue[-1][-1] is None:
-                            # Inference tasks are done, we can check the train queue
-                            task_queue = task_queues[0]
-                        else:
-                            # Inference tasks are still available, we continue checking the inference queue
-                            task_queue = task_queues[1]
-
-                except Exception as e:
-                    print(f"Error during task queue indexing: {e}")
-                    continue
+            # if self.strategy == "async" or self.strategy == "sync": 
+            #     # For sync or async strategy, we only need to check the first queue
+            #     bin, reach_end = self.scheduler.best_fit_allocate(
+            #         task_queues[0], 
+            #         preloaded_tasks, 
+            #         iteration=record_metrics["iteration"],
+            #         model=self.model, 
+            #         attn_implementation=self.attn_implementation,
+            #         eval_metrics=True,
+            #         memory_threshold=self.memory_threshold,
+            #         task_limit=self.task_limit,
+            #     )
+            #     if bin is None:
+            #         # No suitable bin found, continue to the next iteration
+            #         continue
+            #     record_metrics["tokens"] += bin.get_num_tasks()
                 
-                try:
-                    # pdb.set_trace()
-                    bin, reach_end = self.scheduler.best_fit_allocate(
-                        task_queue, 
-                        preloaded_tasks, 
-                        iteration=record_metrics["iteration"],
-                        model=self.model, 
-                        attn_implementation=self.attn_implementation,
-                        eval_metrics=True,
-                        memory_threshold=self.memory_threshold,
-                        task_limit=self.task_limit,
-                    )
-                except Exception as e:
-                    print(f"Error during task scheduling: {e}")
-                    traceback.print_exc()
-                    continue
-                
-                try:
-                    # pdb.set_trace()
-                    if bin is None:
-                        # No suitable bin found, continue to the next iteration
-                        continue
-                    record_metrics["tokens"] += bin.get_num_tasks()
+            #     bin.concurrent_execute(
+            #         model=self.model, 
+            #         tokenizer=self.tokenizer, 
+            #         task_queue=task_queues[0], 
+            #         optimizer=self.optimizer,
+            #         memory_threshold=self.memory_threshold, 
+            #         **self.kwargs,
+            #     )
 
-                    bin.concurrent_execute(
-                        model=self.model, 
-                        tokenizer=self.tokenizer, 
-                        task_queue=task_queue, 
-                        optimizer=self.optimizer,
-                        memory_threshold=self.memory_threshold, 
-                        **self.bin_kwargs,
-                    )
-                except Exception as e:
-                    print(f"Error during task execution: {e}")
-                    continue
+            # else:
+            #     # For synchronous strategy, we need to check both queues
+            #     # pdb.set_trace()
+            #     try:
+            #         if self.strategy == "train-first":
+            #             # As long as train_queue is not empty, we schedule train tasks and execute them
+            #             if task_queues[0].qsize() == 1 and task_queues[0].queue[-1][-1] is None:
+            #                 # Training tasks are done, we can check the test queue
+            #                 task_queue = task_queues[1]
+            #             else:
+            #                 # Training tasks are still available, we continue checking the training queue
+            #                 task_queue = task_queues[0]
+            #         elif self.strategy == "test-first":
+            #             # As long as test_queue is not empty, we schedule test tasks and execute them
+            #             if task_queues[1].qsize() == 1 and task_queues[1].queue[-1][-1] is None:
+            #                 # Inference tasks are done, we can check the train queue
+            #                 task_queue = task_queues[0]
+            #             else:
+            #                 # Inference tasks are still available, we continue checking the inference queue
+            #                 task_queue = task_queues[1]
+
+            #     except Exception as e:
+            #         print(f"Error during task queue indexing: {e}")
+            #         continue
+                
+            #     try:
+            #         # pdb.set_trace()
+            #         bin, reach_end = self.scheduler.best_fit_allocate(
+            #             task_queue, 
+            #             preloaded_tasks, 
+            #             iteration=record_metrics["iteration"],
+            #             model=self.model, 
+            #             attn_implementation=self.attn_implementation,
+            #             eval_metrics=True,
+            #             memory_threshold=self.memory_threshold,
+            #             task_limit=self.task_limit,
+            #         )
+            #     except Exception as e:
+            #         print(f"Error during task scheduling: {e}")
+            #         traceback.print_exc()
+            #         continue
+                
+            #     try:
+            #         # pdb.set_trace()
+            #         if bin is None:
+            #             # No suitable bin found, continue to the next iteration
+            #             continue
+            #         record_metrics["tokens"] += bin.get_num_tasks()
+
+            #         bin.concurrent_execute(
+            #             model=self.model, 
+            #             tokenizer=self.tokenizer, 
+            #             task_queue=task_queue, 
+            #             optimizer=self.optimizer,
+            #             memory_threshold=self.memory_threshold, 
+            #             **self.kwargs,
+            #         )
+            #     except Exception as e:
+            #         print(f"Error during task execution: {e}")
+            #         continue
 
             record_metrics["iteration"] += 1
             if reach_end and all((task_queue.qsize() == 1 and task_queue.queue[-1][-1] is None) for task_queue in task_queues): 
@@ -262,13 +292,13 @@ class EffiGenTune:
             )
 
         # Create iteration bin and execute tasks
-        if self.strategy == "async" or self.strategy == "sync":
-            task_queues = [IterQueue()]
-        else:
-            # Maintain two queues, first is for retraining, second is for inference
-            task_queues = [IterQueue(), IterQueue()]
+        task_queues = [IterQueue()]
+        # if self.strategy == "async" or self.strategy == "sync":
+        #     task_queues = [IterQueue()]
+        # else:
+        #     # Maintain two queues, first is for retraining, second is for inference
+        #     task_queues = [IterQueue(), IterQueue()]
             
-
         record_metrics = {}
         start = time.time()
 
@@ -292,7 +322,10 @@ class EffiGenTune:
         # Save the task's prompt and response to a file
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
+        if self.layer_selection is not None:
+            output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}_{self.layer_selection}-{self.layer_threshold}.json")
+        else:
+            output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
         eval_metrics = self.compute_metrics(preloaded_tasks)
         metrics = {
             "arrival_rate": self.arrival_rate,
@@ -361,7 +394,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0, help="GPU device number")
-    parser.add_argument("--strategy", type=str, default="sync", choices=["async", "sync", "train-first", "test-first"], help="Scheduling strategy")
+    parser.add_argument("--strategy", type=str, default="sync", choices=["async", "sync", "train-first", "test-first", "train-middle"], help="Scheduling strategy")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", choices=["flash_attention_2", "eager"], help="Attention implementation")
     parser.add_argument("--model_path", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", help="Path to the model")
     parser.add_argument("--data_path", type=str, default="data/Anthropic", help="Path to the dataset")
@@ -376,6 +409,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum number of new tokens to generate")
     parser.add_argument("--memory_threshold", type=float, default=0.95, help="Memory threshold for bin packing")
     parser.add_argument("--task_limit", type=int, default=50, help="Task limit for bin packing")
+    parser.add_argument("--loss_threshold", type=float, default=None, help="Loss threshold for selective training")
+    parser.add_argument("--layer_selection", type=str, default=None, choices=["RGN", "SNR"], help="Layer selection method for selective training")
+    parser.add_argument("--layer_threshold", type=float, default=0.5, help="Layer threshold for selective training")
     args = parser.parse_args()
     
     

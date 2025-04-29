@@ -620,7 +620,7 @@ def main(args):
                     example["output_max_len"] = output_max_len
                     example["generation_profile"] = []
             
-            elif args.experiment == "fine-tune":
+            else:
                 example["generation_profile"] = []
                 model.train()
                 inputs["labels"] = inputs.input_ids
@@ -642,7 +642,7 @@ def main(args):
                     memory_used = torch.cuda.max_memory_allocated(inputs.input_ids.device) / (1024**2)  # MB
 
                     example["generation_profile"].append({
-                        "operation": "fine-tune",
+                        "operation": args.experiment,
                         "cur_length": length,
                         "latency": latency,
                         "memory_used": memory_used,
@@ -651,7 +651,7 @@ def main(args):
                 except Exception as e:
                     print(e)
                     example["generation_profile"].append({
-                        "operation": "fine-tune",
+                        "operation": args.experiment,
                         "cur_length": length,
                         "latency": "OOM",
                         "memory_used": "OOM",
@@ -696,7 +696,7 @@ if __name__ == "__main__":
     parser.add_argument('--pyram_beta', type=float, default=20)
     parser.add_argument('--length', type=int, default=1)
     parser.add_argument('--device', type=int, default=None)
-    parser.add_argument("--experiment", type=str, default="decode", choices=["prefill", "decode", "fine-tune"])
+    parser.add_argument("--experiment", type=str, default="decode", choices=["prefill", "decode", "fine-tune", "full-train"])
 
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
@@ -747,17 +747,18 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation
     )
 
-    # Apply LoRA configuration
-    lora_config = LoraConfig(
-        r=16,  # LoRA rank
-        lora_alpha=16,  # Scaling factor
-        target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
-        lora_dropout=0.05,
-        task_type="CAUSAL_LM",
-        bias="none"
-    )
-    # Wrap model with LoRA
-    model = get_peft_model(model, lora_config)
+    if args.experiment == "fine-tune":  # LoRA 
+        # Apply LoRA configuration
+        lora_config = LoraConfig(
+            r=16,  # LoRA rank
+            lora_alpha=16,  # Scaling factor
+            target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
+            lora_dropout=0.05,
+            task_type="CAUSAL_LM",
+            bias="none"
+        )
+        # Wrap model with LoRA
+        model = get_peft_model(model, lora_config)
     
     args.result_data = {}
 
