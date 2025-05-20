@@ -66,18 +66,10 @@ class EffiGenTune:
         )
 
         # Apply LoRA configuration
-        # lora_config = LoraConfig(
-        #     r=16, 
-        #     lora_alpha=16, 
-        #     target_modules=["q_proj", "v_proj"], 
-        #     lora_dropout=0.05, 
-        #     task_type="CAUSAL_LM", 
-        #     bias="none",
-        # )
         lora_config = LoraConfig(
             r=16,  # LoRA rank
-            lora_alpha=64,  # Scaling factor
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Apply LoRA to all attention layers
+            lora_alpha=64,  # Scaling factor, 16
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # ["q_proj", "v_proj"]
             lora_dropout=0.05,
             task_type="CAUSAL_LM",
             bias="none"

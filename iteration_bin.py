@@ -131,18 +131,6 @@ class Bin:
         latency_fit = max_latency - batch_latency
         return batch_memory, batch_latency, batch_length, memory_fit, latency_fit
         
-        # Update the bin stats
-        # self.total_memory = self.base_memory + accumulated_memory
-        # self.max_latency = max(self.max_latency, latency)
-        # if self.free_memory < memory:
-        #     logging.warning(f"Memory overflow! Preallocate: {self.total_memory} MB, capacity: {self.memory_capacity} MB")
-        # self.free_memory = max(self.memory_capacity - self.total_memory, 0)
-        # elif operation == "clear":
-        #     self.total_memory = self.base_memory
-        #     self.max_latency = 0
-        #     self.free_memory = self.memory_capacity - self.base_memory
-        # else:
-        #     raise ValueError(f"Invalid operation: {operation}. Choose 'add' or 'clear'.")
 
     @profile
     def _create_batch(
@@ -163,35 +151,54 @@ class Bin:
         inputs = batch_collator(inputs)
         inputs["past_key_values"] = None
 
-        # For inference-only: pad key values with varient sequence lengths
+        # Handle case where all caches are None
         split_caches = [task.past_key_values for task in batch]
-        if all(c is None for c in split_caches):  # Handle case where all caches are None
+        if all(c is None for c in split_caches):  
             return prepare_inputs(inputs, device=device)
-       
+
+        # For decode-only: pad key values with varient sequence lengths
         ref_cache = next(c for c in split_caches if c is not None)
-        if ref_cache is not None:
-            attention_mask = inputs[self.inference_mask_feature][:, :-1]  # Remove the newly decoded token
-            batch_size, max_seq_len = attention_mask.shape
-            num_heads, _, head_dim  = ref_cache.key_cache[0].shape
-            inputs["past_key_values"] = DynamicCache()
+        attention_mask = inputs[self.inference_mask_feature][:, :-1]  # Remove decode step
+        batch_size, max_seq_len = attention_mask.shape
+        num_heads, _, head_dim  = ref_cache.key_cache[0].shape
+        inputs["past_key_values"] = DynamicCache()
 
-            for layer_idx in range(len(ref_cache.key_cache)):
-                key_tensor = torch.zeros(
-                    (batch_size, num_heads, max_seq_len, head_dim),
-                    dtype=ref_cache.key_cache[layer_idx].dtype,
-                    device=ref_cache.key_cache[layer_idx].device,
-                )
-                value_tensor = torch.zeros_like(key_tensor)
+        valid_lens = attention_mask.sum(dim=1).tolist()
+        pad_left = tokenizer.padding_side == "left"
+        non_empty = [(i, c) for i, c in enumerate(split_caches) if c is not None]
 
-                for i in range(batch_size):
-                    if split_caches[i] is None:
-                        continue  # Skip samples without KV cache (zero)
-                    # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
-                    mask = attention_mask[i] == 1
-                    key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
-                    value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
-                inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
+        for layer_idx in range(len(ref_cache.key_cache)):
+            # key_tensor = torch.zeros(
+            #     (batch_size, num_heads, max_seq_len, head_dim),
+            #     dtype=ref_cache.key_cache[layer_idx].dtype,
+            #     device=ref_cache.key_cache[layer_idx].device,
+            # )
+            # value_tensor = torch.zeros_like(key_tensor)
+            # for i in range(batch_size):
+            #     if split_caches[i] is None:
+            #         continue  # Skip samples without KV cache (zero)
+            #     # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
+            #     mask = attention_mask[i] == 1
+            #     key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
+            #     value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
+            # inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
 
+            k_buf = torch.empty(
+                (batch_size, num_heads, max_seq_len, head_dim),
+                dtype=ref_cache.key_cache[layer_idx].dtype,
+                device=ref_cache.key_cache[layer_idx].device,
+            )
+            v_buf = torch.empty_like(k_buf)
+            for i, c in non_empty:
+                T_i = valid_lens[i]
+                if pad_left:
+                    target_slice = slice(max_seq_len - T_i, max_seq_len)
+                else:
+                    target_slice = slice(0, T_i)
+                k_buf[i, :, target_slice, :] = c.key_cache[layer_idx]
+                v_buf[i, :, target_slice, :] = c.value_cache[layer_idx]
+            inputs["past_key_values"].update(k_buf, v_buf, layer_idx)
+            
         return prepare_inputs(inputs, device=device)
     
     @profile
@@ -226,11 +233,9 @@ class Bin:
             next_tokens = torch.argmax(next_token_scores, dim=-1)  # Greedy decoding (B)
         # Update unfinished sequences
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(tokenizer.eos_token_id).long())
-        # stoppings = stopping_criteria(input_ids, next_tokens_scores)
     
         # Update task status
         for i, task in enumerate(batch):
-            # print(f"Task {task.taskID} (step {task.step}, workload {task.workload}), current task queue {task_queue.queue}")
             task.update_decoding(next_tokens[i].item())
             # if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
             if unfinished_sequences[i] == 1 and task.step < max_new_tokens: # continue decoding
@@ -246,12 +251,6 @@ class Bin:
                         past_key_values.value_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
                         layer_idx=layer_idx,
                     )
-                    # task.past_key_values.update(
-                    #     past_key_values.key_cache[layer_idx][i, :, mask, :].cpu(),  # [H, S_valid, D]
-                    #     past_key_values.value_cache[layer_idx][i, :, mask, :].cpu(),  # [H, S_valid, D]
-                    #     layer_idx=layer_idx,
-                    # )
-                # print(f"Cache size (new): {task.past_key_values.key_cache[0].shape}")
                 # Add task back to queue
                 task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
             else:  # stop decoding
@@ -281,9 +280,6 @@ class Bin:
     ):
         if not batch:
             return 
-        
-        # # Print all the arguments
-        # print(f"\nmax_new_tokens: {max_new_tokens}, memory_threshold: {memory_threshold}, loss_threshold: {loss_threshold}, layer_selection: {layer_selection}, layer_threshold: {layer_threshold}\n")
         
         inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
         memory_threshold = memory_threshold if memory_threshold is not None else 0.95
