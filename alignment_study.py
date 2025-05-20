@@ -471,7 +471,7 @@ class DPOTrainer(Trainer):
 
 
 
-def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epochs=1, test_iter=None, test_train_rate=1, samples_per_train=1, output_generation=False):
+def training_loop(model, train_dataloader, device=0, optimizer=None, scaler=None, num_epochs=1, test_iter=None, test_train_rate=1, samples_per_train=1, output_generation=False):
     """Simple training loop for DPO model"""
     # Define optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5) if optimizer is None else optimizer
@@ -498,12 +498,14 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
                 eval_tq = tqdm.tqdm(range(iter_samples), desc="Evaluating", total=iter_samples)
                 for _ in eval_tq:
                     try:
+                        # eval_batch = next(test_iter).to(device)
                         eval_batch = next(test_iter)
+                        eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
                     except StopIteration:
                         break
                     
                     # Compute metrics
-                    eval_outputs = compute_batch_metrics(model, eval_batch, "cuda")
+                    eval_outputs = compute_batch_metrics(model, eval_batch)
                     eval_steps += 1
                     
                     eval_loss += eval_outputs["loss"]
@@ -549,7 +551,7 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
             optimizer.zero_grad()  # Reset gradients
 
             # Move batch to GPU
-            batch = {k: v.cuda() for k, v in batch.items()}
+            batch = {k: v.to(device) for k, v in batch.items()}
 
             with torch.amp.autocast("cuda"):  # Mixed precision
                 loss = dpo_loss(model, batch)
@@ -591,21 +593,27 @@ def training_loop(model, train_dataloader, optimizer=None, scaler=None, num_epoc
 
 
 if __name__ == "__main__":
-    import os
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0, help="GPU device number")
+    parser.add_argument("--strategy", type=str, default="continuous", choices=["continuous", "periodic"], help="Scheduling strategy")
+    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", choices=["flash_attention_2", "eager"], help="Attention implementation")
+    parser.add_argument("--model_path", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", help="Path to the model")
+    parser.add_argument("--data_path", type=str, default="data/StanfordNLP", help="Path to the dataset")
+    args = parser.parse_args()
 
-    # EXPORT the first CUDA device for this program
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     # Set reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
-
-    n_test_samples = 200
-    retrain_rate = 0.1
+    n_test_samples = 500
+    retrain_rate = 0.2
     n_train_samples = int(n_test_samples * retrain_rate)
+    strategy = args.strategy  # continuous, periodic
+    data_path = args.data_path
 
     # === Load Model & Tokenizer ===
-    model_name = "mistralai/Mistral-7B-Instruct-v0.2"  # "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name = args.model_path  # "meta-llama/Meta-Llama-3-8B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -617,16 +625,17 @@ if __name__ == "__main__":
         model_name,
         low_cpu_mem_usage=True,
         torch_dtype=torch.float16,
-        device_map="auto",
+        device_map={"": args.device},
         use_cache=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_implementation,
     )  # Load fine-tuned model
 
     # Apply LoRA configuration
     lora_config = LoraConfig(
         r=16,  # LoRA rank
-        lora_alpha=16,  # Scaling factor
-        target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
+        lora_alpha=64,  # Scaling factor
+        # target_modules=["q_proj", "v_proj"],  # Apply LoRA only to attention layers
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Apply LoRA to all attention layers
         lora_dropout=0.05,
         task_type="CAUSAL_LM",
         bias="none"
@@ -644,7 +653,7 @@ if __name__ == "__main__":
     
     # Load and process datasets
     test_train_rate = int(1 / retrain_rate)
-    rlhf_data = load_dataset("data/Anthropic")
+    rlhf_data = load_dataset(data_path)
     train_samples = min(n_train_samples, len(rlhf_data["train"]))
     train_dataset = rlhf_data["train"].select(range(train_samples))
     processed_train_dataset = train_dataset.map(
@@ -717,18 +726,19 @@ if __name__ == "__main__":
     # trainer.train()
 
     print(f"Eval steps per train: {test_train_rate}")
-    # samples_per_train = training_batch_size
-    samples_per_train = train_samples
+    samples_per_train = train_samples if strategy == "periodic" else training_batch_size
     eval_metrics = training_loop(
         model, 
         train_dataloader, 
+        device=args.device,
         test_iter=test_iter, 
         test_train_rate=test_train_rate,
         samples_per_train=samples_per_train,
         output_generation=True,
     )
     # Save eval_metrics to json file (indent for readability)
-    with open(f"eval_metrics-{train_samples}-{test_train_rate}-{samples_per_train}.json", "w") as f:
+    data_name = args.data_path.split("/")[-1]
+    with open(f"{data_name}-{strategy}-{test_train_rate}.json", "w") as f:
         json.dump(eval_metrics, f, indent=4)
 
     # # Evaluate after LoRA fine-tuning

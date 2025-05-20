@@ -1,11 +1,11 @@
 # A definition of the Producer class and supported functions.
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import time
 import random
 import pdb
 import sys 
 sys.dont_write_bytecode = True
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer
 from iteration_task import Task  
 from iteration_queue import IterQueue
@@ -28,25 +28,85 @@ class Producer:
         self.n_test_samples = n_test_samples 
         self.strategy = strategy
         self.n_train_samples = int(self.n_test_samples * retrain_rate)
+
+    
+    @staticmethod
+    def load_and_prepare_datasets(dataset_names, n_train_samples, n_test_samples):
+        """
+        Load multiple datasets, tag each example with its dataset name, and combine their train/test splits.
+
+        Args:
+            dataset_names (str or list of str): Path(s) to dataset(s).
+            n_train_samples (int): Number of training samples to select.
+            n_test_samples (int): Number of test samples to select.
+
+        Returns:
+            train_dataset, test_dataset: Datasets ready for training and evaluation.
+        """
+        if isinstance(dataset_names, str):
+            dataset_names = [dataset_names]
+
+        all_train = []
+        all_test = []
+
+        for name in dataset_names:
+            data = load_dataset(name)
+
+            # Add source_dataset field
+            train_indices = random.sample(range(len(data['train'])), n_train_samples)
+            train_data = data['train'].select(train_indices).map(lambda ex: {"source_dataset": name})
+            test_indices = random.sample(range(len(data['test'])), n_test_samples)
+            test_data = data['test'].select(test_indices).map(lambda ex: {"source_dataset": name})
+
+            all_train.append(train_data)
+            all_test.append(test_data)
+
+        # Merge all train and all test
+        train_dataset = concatenate_datasets(all_train)
+        test_dataset = concatenate_datasets(all_test)
+
+        # Optionally, you can shuffle the datasets
+        train_dataset = train_dataset.shuffle(seed=42)
+        test_dataset = test_dataset.shuffle(seed=42)
+
+        # # Sample train/test subsets
+        # train_indices = random.sample(range(len(merged_train)), min(n_train_samples, len(merged_train)))
+        # test_indices = random.sample(range(len(merged_test)), min(n_test_samples, len(merged_test)))
+
+        # train_dataset = merged_train.select(train_indices)
+        # test_dataset = merged_test.select(test_indices)
+
+        return train_dataset, test_dataset
+
         
 
     def load_dataset(
         self, 
         tokenizer: AutoTokenizer,
         max_length: int,
-        dataset_name: str = "data/Anthropic",
+        dataset_name: Union[str, List[str]] = "data/Anthropic",
     ) -> List[Task]:
         """
         Load dataset and tokenize inputs. Create a preloaded dataset of Task objects.
         """
-        
         random.seed(42)
         # Load dataset 
-        rlhf_data = load_dataset(dataset_name)
-        test_indices = random.sample(range(len(rlhf_data["test"])), self.n_test_samples)
-        test_dataset = rlhf_data["test"].select(test_indices)
-        train_indices = random.sample(range(len(rlhf_data["train"])), self.n_train_samples)
-        train_dataset = rlhf_data["train"].select(train_indices)
+        if isinstance(dataset_name, str):
+            rlhf_data = load_dataset(dataset_name)
+            test_indices = random.sample(range(len(rlhf_data["test"])), self.n_test_samples)
+            test_dataset = rlhf_data["test"].select(test_indices).map(lambda ex: {"source_dataset": dataset_name})
+            train_indices = random.sample(range(len(rlhf_data["train"])), self.n_train_samples)
+            train_dataset = rlhf_data["train"].select(train_indices).map(lambda ex: {"source_dataset": dataset_name})
+        elif isinstance(dataset_name, list):
+            train_dataset, test_dataset = self.load_and_prepare_datasets(
+                dataset_names=dataset_name,
+                n_train_samples=self.n_train_samples,
+                n_test_samples=self.n_test_samples,
+            )
+            self.n_train_samples = self.n_train_samples * len(dataset_name)
+            self.n_test_samples = self.n_test_samples * len(dataset_name)
+        else:
+            raise ValueError("dataset_name must be a string or a list of strings.")
 
         # Define batch tokenization
         def tokenize_and_align_labels(examples):
@@ -84,7 +144,6 @@ class Producer:
                 "rejected_attention_mask": rejected_encodings["attention_mask"],
             }
 
-
         processed_test_dataset = test_dataset.map(
             tokenize_and_align_labels,
             batched=True,
@@ -109,6 +168,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=train_dataset[train_idx]["context"],
                     input_kwargs=processed_train_dataset[train_idx],
+                    source_dataset=train_dataset[train_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
             for test_idx in range(self.n_test_samples):
@@ -118,6 +178,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[test_idx]["context"],
                     input_kwargs=processed_test_dataset[test_idx],
+                    source_dataset=test_dataset[test_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
 
@@ -131,6 +192,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[test_idx]["context"],
                     input_kwargs=processed_test_dataset[test_idx],
+                    source_dataset=test_dataset[test_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
             for train_idx in range(self.n_train_samples):
@@ -140,6 +202,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=train_dataset[train_idx]["context"],
                     input_kwargs=processed_train_dataset[train_idx],
+                    source_dataset=train_dataset[train_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
 
@@ -153,6 +216,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[test_idx]["context"],
                     input_kwargs=processed_test_dataset[test_idx],
+                    source_dataset=test_dataset[test_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
             for train_idx in range(self.n_train_samples):
@@ -162,6 +226,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=train_dataset[train_idx]["context"],
                     input_kwargs=processed_train_dataset[train_idx],
+                    source_dataset=train_dataset[train_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
             for second_test_idx in range(test_idx + 1, self.n_test_samples):
@@ -171,6 +236,7 @@ class Producer:
                     rate_lambda=self.arrival_rate, 
                     prompt=test_dataset[second_test_idx]["context"],
                     input_kwargs=processed_test_dataset[second_test_idx],
+                    source_dataset=test_dataset[second_test_idx]["source_dataset"],
                 )
                 preloaded_tasks.append(task)
 
@@ -187,6 +253,7 @@ class Producer:
                         rate_lambda=self.arrival_rate, 
                         prompt=train_dataset[train_idx]["context"],
                         input_kwargs=processed_train_dataset[train_idx],
+                        source_dataset=train_dataset[train_idx]["source_dataset"],
                     )
                     train_idx += 1
                 else:
@@ -197,6 +264,7 @@ class Producer:
                         rate_lambda=self.arrival_rate, 
                         prompt=test_dataset[test_idx]["context"],
                         input_kwargs=processed_test_dataset[test_idx],
+                        source_dataset=test_dataset[test_idx]["source_dataset"],
                     )
                     test_idx += 1
 

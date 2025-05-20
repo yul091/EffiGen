@@ -80,10 +80,16 @@ class Bin:
         self.workload_stats[task.workload]["latency"] = batch_latency
         self.max_latency = max(self.max_latency, batch_latency)
         
-        
 
-    def get_num_tasks(self) -> int:
-        return len(self.prefill_batch) + len(self.decode_batch) + len(self.train_batch)
+    def get_num_tasks(self, target: str = "all") -> int:
+        if target == "all":
+            return len(self.prefill_batch) + len(self.decode_batch) + len(self.train_batch)
+        elif target == "inference":
+            return len(self.prefill_batch) + len(self.decode_batch)
+        elif target == "train":
+            return len(self.train_batch)
+        else:
+            raise ValueError(f"Invalid target: {target}. Supported targets: all, inference, train.")
         
 
     def get_workload(
@@ -319,7 +325,8 @@ class Bin:
                 # Update task status
                 for i, task in enumerate(batch):
                     task.metrics["loss"] = losses[i].item()
-                    task.execution_time = execution_time
+                    if task.execution_time is None:
+                        task.execution_time = execution_time
                     print(f"Task {task.taskID} ({task.workload}) finished with loss {task.metrics['loss']}")
             else:
                 model.eval()
@@ -349,7 +356,8 @@ class Bin:
                             for i, task in enumerate(batch):
                                 for key, value in eval_outputs.items():
                                     task.metrics[key] = value[i].item()
-                                task.execution_time = execution_time
+                                if task.execution_time is None:
+                                    task.execution_time = execution_time
                     else:
                         # Decode the next token
                         outputs = model_forward(
@@ -376,7 +384,8 @@ class Bin:
         except Exception as e:
             logging.error(f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}")
             for task in batch:
-                task.execution_time = execution_time
+                if task.execution_time is None:
+                    task.execution_time = execution_time
                 task.response = "Error occurred during execution."
                 task.metrics["error"] = str(e)
 

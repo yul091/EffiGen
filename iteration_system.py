@@ -36,7 +36,7 @@ class EffiGenTune:
         self.strategy = args.strategy
         self.attn_implementation = args.attn_implementation
         self.model_path = args.model_path
-        self.data_path = args.data_path
+        self.data_path = args.data_path if args.data_path != "data/mixed" else ["data/Anthropic", "data/StanfordNLP", "data/OpenAI"]
         self.arrival_rate = args.arrival_rate
         self.arrival_pattern = args.arrival_pattern
         self.n_test_samples = args.n_test_samples
@@ -66,13 +66,21 @@ class EffiGenTune:
         )
 
         # Apply LoRA configuration
+        # lora_config = LoraConfig(
+        #     r=16, 
+        #     lora_alpha=16, 
+        #     target_modules=["q_proj", "v_proj"], 
+        #     lora_dropout=0.05, 
+        #     task_type="CAUSAL_LM", 
+        #     bias="none",
+        # )
         lora_config = LoraConfig(
-            r=16, 
-            lora_alpha=16, 
-            target_modules=["q_proj", "v_proj"], 
-            lora_dropout=0.05, 
-            task_type="CAUSAL_LM", 
-            bias="none",
+            r=16,  # LoRA rank
+            lora_alpha=64,  # Scaling factor
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Apply LoRA to all attention layers
+            lora_dropout=0.05,
+            task_type="CAUSAL_LM",
+            bias="none"
         )
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
@@ -128,6 +136,7 @@ class EffiGenTune:
         record_metrics = record_metrics if record_metrics is not None else {}
         record_metrics["iteration"] = 0
         record_metrics["tokens"] = 0
+        record_metrics["inference_tokens"] = 0
         
         while True:
             qsize = sum(task_queue.qsize() for task_queue in task_queues)
@@ -151,6 +160,7 @@ class EffiGenTune:
                 # No suitable bin found, continue to the next iteration
                 continue
             record_metrics["tokens"] += bin.get_num_tasks()
+            record_metrics["inference_tokens"] += bin.get_num_tasks(target="inference")
             
             bin.concurrent_execute(
                 model=self.model, 
@@ -335,6 +345,7 @@ class EffiGenTune:
             "iteration": record_metrics["iteration"],
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),
+            "throughput_inference": record_metrics["inference_tokens"] / (end - start),
             "metrics": eval_metrics,
             "generation_results": [
                 {
@@ -346,7 +357,9 @@ class EffiGenTune:
                     "metrics": task.metrics,
                     "release_time": task.release_time,
                     "execution_time": task.execution_time,
+                    "decode_times": task.decode_times,
                     "priority": task.get_priority(self.strategy, initial=False),
+                    "source_dataset": task.source_dataset,
                 }
                 for task in preloaded_tasks
             ],

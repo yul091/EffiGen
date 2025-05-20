@@ -19,6 +19,7 @@ class Task:
         input_kwargs: Optional[Dict[str, List[Any]]] = None,
         past_key_values: Optional[DynamicCache] = None,
         coefficients: Optional[Dict[str, Dict[str, float]]] = None,
+        source_dataset: Optional[str] = None,
     ):
         """
         Initialize a Task object.
@@ -32,8 +33,8 @@ class Task:
         # Fixed attributes
         self.taskID = taskID
         self.coefficients = coefficients if coefficients is not None else {
-            "prefill": {"base_priority": -5, "priority_factor": -6e-2, "latency_coeff": 3.9e-6, "memory_coeff": 5e-5},
-            "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 4.9e-5},
+            "prefill": {"base_priority": -5, "priority_factor": -6e-2, "latency_coeff": 3.9e-6, "memory_coeff": 1.5e-4},
+            "decode": {"base_priority": -7, "priority_factor": -2e-2, "latency_coeff": 9.1e-7, "memory_coeff": 1e-4},
             "train": {"base_priority": -2, "priority_factor": -2e-1, "latency_coeff": 9.9e-6, "memory_coeff": 3e-4},
         }
         if self.coefficients is not None and workload not in self.coefficients:
@@ -41,6 +42,7 @@ class Task:
         self.workload = workload
         self.rate_lambda = rate_lambda
         self.prompt = prompt
+        self.source_dataset = source_dataset
         # Changable attributes
         self.input_kwargs = input_kwargs if input_kwargs is not None else {}
         self.prompt_length = len(self.input_kwargs.get(self.CONTEXT_FEATURE, []))
@@ -48,6 +50,7 @@ class Task:
         self.step = 0
         self.release_time = None
         self.execution_time = None
+        self.decode_times = []
         self.response = ""
         self.metrics = {}
 
@@ -68,6 +71,7 @@ class Task:
     def update_decoding(self, next_token: int):
         self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode
         self.step += 1
+        self.decode_times.append(time.time())
         # Update the input_kwargs
         self.input_kwargs[self.CONTEXT_FEATURE].append(next_token)
         self.input_kwargs[self.CONTEXT_MASK].append(1)
