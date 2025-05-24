@@ -3,6 +3,7 @@ import os
 from typing import List, Optional, Dict, Any
 import time
 import traceback
+import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, MinLengthLogitsProcessor
@@ -163,93 +164,7 @@ class EffiGenTune:
                 **self.kwargs,
             )
 
-            # if self.strategy == "async" or self.strategy == "sync": 
-            #     # For sync or async strategy, we only need to check the first queue
-            #     bin, reach_end = self.scheduler.best_fit_allocate(
-            #         task_queues[0], 
-            #         preloaded_tasks, 
-            #         iteration=record_metrics["iteration"],
-            #         model=self.model, 
-            #         attn_implementation=self.attn_implementation,
-            #         eval_metrics=True,
-            #         memory_threshold=self.memory_threshold,
-            #         task_limit=self.task_limit,
-            #     )
-            #     if bin is None:
-            #         # No suitable bin found, continue to the next iteration
-            #         continue
-            #     record_metrics["tokens"] += bin.get_num_tasks()
-                
-            #     bin.concurrent_execute(
-            #         model=self.model, 
-            #         tokenizer=self.tokenizer, 
-            #         task_queue=task_queues[0], 
-            #         optimizer=self.optimizer,
-            #         memory_threshold=self.memory_threshold, 
-            #         **self.kwargs,
-            #     )
-
-            # else:
-            #     # For synchronous strategy, we need to check both queues
-            #     # pdb.set_trace()
-            #     try:
-            #         if self.strategy == "train-first":
-            #             # As long as train_queue is not empty, we schedule train tasks and execute them
-            #             if task_queues[0].qsize() == 1 and task_queues[0].queue[-1][-1] is None:
-            #                 # Training tasks are done, we can check the test queue
-            #                 task_queue = task_queues[1]
-            #             else:
-            #                 # Training tasks are still available, we continue checking the training queue
-            #                 task_queue = task_queues[0]
-            #         elif self.strategy == "test-first":
-            #             # As long as test_queue is not empty, we schedule test tasks and execute them
-            #             if task_queues[1].qsize() == 1 and task_queues[1].queue[-1][-1] is None:
-            #                 # Inference tasks are done, we can check the train queue
-            #                 task_queue = task_queues[0]
-            #             else:
-            #                 # Inference tasks are still available, we continue checking the inference queue
-            #                 task_queue = task_queues[1]
-
-            #     except Exception as e:
-            #         print(f"Error during task queue indexing: {e}")
-            #         continue
-                
-            #     try:
-            #         # pdb.set_trace()
-            #         bin, reach_end = self.scheduler.best_fit_allocate(
-            #             task_queue, 
-            #             preloaded_tasks, 
-            #             iteration=record_metrics["iteration"],
-            #             model=self.model, 
-            #             attn_implementation=self.attn_implementation,
-            #             eval_metrics=True,
-            #             memory_threshold=self.memory_threshold,
-            #             task_limit=self.task_limit,
-            #         )
-            #     except Exception as e:
-            #         print(f"Error during task scheduling: {e}")
-            #         traceback.print_exc()
-            #         continue
-                
-            #     try:
-            #         # pdb.set_trace()
-            #         if bin is None:
-            #             # No suitable bin found, continue to the next iteration
-            #             continue
-            #         record_metrics["tokens"] += bin.get_num_tasks()
-
-            #         bin.concurrent_execute(
-            #             model=self.model, 
-            #             tokenizer=self.tokenizer, 
-            #             task_queue=task_queue, 
-            #             optimizer=self.optimizer,
-            #             memory_threshold=self.memory_threshold, 
-            #             **self.kwargs,
-            #         )
-            #     except Exception as e:
-            #         print(f"Error during task execution: {e}")
-            #         continue
-
+            # Update the preloaded tasks with the executed tasks
             record_metrics["iteration"] += 1
             if reach_end and all((task_queue.qsize() == 1 and task_queue.queue[-1][-1] is None) for task_queue in task_queues): 
                 # Because we always put back the end signal for each queue
@@ -318,9 +233,7 @@ class EffiGenTune:
             executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
 
         end = time.time()
-        print(f"Total time: {end - start}, throughput: {record_metrics['tokens'] / (end - start)} tokens/sec")
-
-
+       
         # Save the task's prompt and response to a file
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
         os.makedirs(output_dir, exist_ok=True)
@@ -328,7 +241,8 @@ class EffiGenTune:
             output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}_{self.layer_selection}-{self.layer_threshold}.json")
         else:
             output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
-        eval_metrics = self.compute_metrics(preloaded_tasks)
+        eval_metrics = self.compute_metrics([task for task in preloaded_tasks if task.workload != 'train'])
+        train_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'train']
         metrics = {
             "arrival_rate": self.arrival_rate,
             "retrain_rate": self.retrain_rate,
@@ -338,7 +252,9 @@ class EffiGenTune:
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),
             "throughput_inference": record_metrics["inference_tokens"] / (end - start),
-            "metrics": eval_metrics,
+            "avg_decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,
+            "train_loss": np.mean(train_losses) if train_losses else 0,
+            "eval_metrics": eval_metrics,
             "generation_results": [
                 {
                     "taskID": task.taskID,
@@ -356,6 +272,7 @@ class EffiGenTune:
                 for task in preloaded_tasks
             ],
         }
+        print(f"Total time: {end - start}, throughput: {record_metrics['tokens'] / (end - start)} tokens/sec, eval metrics: {eval_metrics}")
         save_metrics_with_order(metrics, output_file)
 
 

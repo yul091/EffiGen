@@ -220,8 +220,7 @@ class Bin:
         )
         max_new_tokens = max_new_tokens if max_new_tokens is not None else 1024
         # Finished sentences should have their next token be a padding token
-        batch_size = lm_logits.shape[0]  # shape: [B, S, V]
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
+        batch_size, max_seq_len = attention_mask.shape  # shape: [B, S]
         next_token_logits = lm_logits[:, -1, :]  # B X V
         # Pre-process distribution
         next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -232,7 +231,10 @@ class Bin:
         else:
             next_tokens = torch.argmax(next_token_scores, dim=-1)  # Greedy decoding (B)
         # Update unfinished sequences
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(tokenizer.eos_token_id).long())
+        valid_lengths = attention_mask.sum(dim=1).tolist()
+        pad_left = tokenizer.padding_side == "left"
     
         # Update task status
         for i, task in enumerate(batch):
@@ -243,12 +245,23 @@ class Bin:
                 if past_key_values is None:  
                     continue
                 # Split and update individual task's KV cache
-                mask = attention_mask[i] == 1
                 task.past_key_values = DynamicCache()
+                # mask = attention_mask[i] == 1
+                T_i = valid_lengths[i]
+                if pad_left:
+                    target_slice = slice(max_seq_len - T_i, max_seq_len)
+                else:
+                    target_slice = slice(0, T_i)
+                
                 for layer_idx in range(len(past_key_values.key_cache)):
+                    # task.past_key_values.update(
+                    #     past_key_values.key_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
+                    #     past_key_values.value_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
+                    #     layer_idx=layer_idx,
+                    # )
                     task.past_key_values.update(
-                        past_key_values.key_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
-                        past_key_values.value_cache[layer_idx][i, :, mask, :],  # [H, S_valid, D]
+                        past_key_values.key_cache[layer_idx][i, :, target_slice, :],  # [H, S_valid, D]
+                        past_key_values.value_cache[layer_idx][i, :, target_slice, :],  # [H, S_valid, D]
                         layer_idx=layer_idx,
                     )
                 # Add task back to queue
@@ -257,7 +270,7 @@ class Bin:
                 # Update response (text) with next token
                 task.get_response(tokenizer)
                 # Empty cache
-                del task.past_key_values
+                task.past_key_values = None
                 
 
     @profile
@@ -323,7 +336,13 @@ class Bin:
                     task.metrics["loss"] = losses[i].item()
                     if task.execution_time is None:
                         task.execution_time = execution_time
-                    print(f"Task {task.taskID} ({task.workload}) finished with loss {task.metrics['loss']}")
+                    task.step += 1
+                    # If loss is larger than a threshold, put it back to queue
+                    if task.metrics["loss"] > 1.0:
+                        task_queue.put((task.get_priority(self.strategy, initial=True), task.workload, task.taskID))
+                        print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (put back for retraining)")
+                    else:
+                        print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (finished)") 
             else:
                 model.eval()
                 with torch.no_grad():
