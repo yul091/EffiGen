@@ -14,6 +14,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingA
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
 from torch.utils.data import DataLoader, Dataset
 
+DATASET_LOSS = {
+    "StanfordNLP": 1.0,  # StanfordNLP DPO loss
+    "Anthropic": 0.7,  # Anthropic DPO loss
+    "OpenAI": 1.0,  # OpenAI DPO loss
+}
+
 
 # === Load Test Dataset ===
 # class DPOTESTDataset(Dataset):

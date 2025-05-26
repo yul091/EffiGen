@@ -159,7 +159,7 @@ class Producer:
         preloaded_tasks: List[Task] = []
 
         # We use enqueue time as priority
-        if self.strategy == "train-first":  
+        if self.strategy == "train_first":  
             # Train tasks first, then test tasks
             for train_idx in range(self.n_train_samples):
                 task = Task(
@@ -183,7 +183,7 @@ class Producer:
                 preloaded_tasks.append(task)
 
         # We use enqueue time as priority
-        elif self.strategy == "test-first":  
+        elif self.strategy == "test_first":  
             # Test tasks first, then train tasks
             for test_idx in range(self.n_test_samples):
                 task = Task(
@@ -207,7 +207,7 @@ class Producer:
                 preloaded_tasks.append(task)
 
         # We use enqueue time as priority
-        elif self.strategy == "train-middle":  # split the test into halves, test - train - test
+        elif self.strategy == "train_middle":  # split the test into halves, test - train - test
             # Train tasks in the middle
             for test_idx in range(self.n_test_samples // 2):
                 task = Task(
@@ -240,7 +240,7 @@ class Producer:
                 )
                 preloaded_tasks.append(task)
 
-        # We use pre-defined coefficients as priority
+        # Periodic / Sync / Async
         else:  
             train_prob = self.retrain_rate / (self.retrain_rate + 1)
             train_idx, test_idx = 0, 0

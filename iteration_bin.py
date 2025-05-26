@@ -43,6 +43,8 @@ class Bin:
         self.eval_metrics = eval_metrics
         self.device = device
         self.strategy = strategy
+        self.finished_inference_tasks = 0
+        self.finished_training_tasks = 0
         # Initialize memory and latency
         self.memory_capacity = torch.cuda.get_device_properties(device).total_memory / (1024**2)  # MB
         self.base_memory = torch.cuda.memory_allocated(device) / (1024**2)  # MB
@@ -86,6 +88,10 @@ class Bin:
             return len(self.prefill_batch) + len(self.decode_batch) + len(self.train_batch)
         elif target == "inference":
             return len(self.prefill_batch) + len(self.decode_batch)
+        elif target == "prefill":
+            return len(self.prefill_batch)
+        elif target == "decode":
+            return len(self.decode_batch)
         elif target == "train":
             return len(self.train_batch)
         else:
@@ -269,6 +275,7 @@ class Bin:
             else:  # stop decoding
                 # Update response (text) with next token
                 task.get_response(tokenizer)
+                self.finished_inference_tasks += 1
                 # Empty cache
                 task.past_key_values = None
                 
@@ -305,7 +312,12 @@ class Bin:
                 # Offload the cache to CPU
                 task.past_key_values = _prepare_input(task.past_key_values, device="cpu")
                 # Update task status and put it back to the queue
-                task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
+                if task.workload == "decode":
+                    task.get_response(tokenizer)
+                    self.finished_inference_tasks += 1
+                    print(f"Drop decoding task {task.taskID} due to memory overflow.")
+                else:
+                    task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
             # Clear the batch
             batch.clear()
             return
@@ -338,11 +350,16 @@ class Bin:
                         task.execution_time = execution_time
                     task.step += 1
                     # If loss is larger than a threshold, put it back to queue
-                    if task.metrics["loss"] > 1.0:
+                    if task.metrics["loss"] > loss_threshold:
                         task_queue.put((task.get_priority(self.strategy, initial=True), task.workload, task.taskID))
                         print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (put back for retraining)")
                     else:
+                        self.finished_training_tasks += 1
                         print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (finished)") 
+
+                # # Release memory
+                # del losses
+                # torch.cuda.empty_cache()
             else:
                 model.eval()
                 with torch.no_grad():
@@ -397,11 +414,14 @@ class Bin:
                 del outputs, inputs, model_kwargs, model_inputs
 
         except Exception as e:
-            logging.error(f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}")
+            error_msg = f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}"
+            logging.error(error_msg)
             for task in batch:
                 if task.execution_time is None:
                     task.execution_time = execution_time
-                task.response = "Error occurred during execution."
+                # task.response = error_msg
+                if task.workload != "train":
+                    task.get_response(tokenizer)
                 task.metrics["error"] = str(e)
 
         # Clear the batch
@@ -432,7 +452,7 @@ class Bin:
         else:
             # print(f"Sequantial execution (prioritize training)!")
             # Prioritize the training workload
-            self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            # self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 for workload, batch in [
                     ("prefill", self.prefill_batch),
