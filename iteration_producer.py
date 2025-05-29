@@ -273,7 +273,7 @@ class Producer:
                 preloaded_tasks.append(task)
 
         # pdb.set_trace()
-        print(f"  **  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  **")
+        print(f"\n====  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  ====\n")
         if return_dataset:
             return preloaded_tasks, processed_train_dataset, processed_test_dataset
         return preloaded_tasks
@@ -287,7 +287,7 @@ class Producer:
             time.sleep(random.expovariate(task.rate_lambda))
             if task.workload == "train":
                 # The first queue is always for retraining tasks
-                print(f"  **  Producing task {taskID} ({task.workload}) **  ")
+                # print(f"  ====  Producing task {taskID} ({task.workload}) ====  ")
                 task_queues[0].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
             else:
                 # The last queue is always for inference tasks

@@ -47,9 +47,15 @@ class EffiGenTune:
         self.strategy = args.strategy
         self.retrain_rate = args.retrain_rate
         # Periodic settings
-        steps_per_train = 1 if len(self.strategy.split('-')) == 1 else int(self.strategy.split('-')[1]) 
+        if self.strategy in {"sync", "async"}:
+            steps_per_train = 1
+        else:
+            # For periodic retraining, we set the steps per train based on the strategy
+            steps_per_train = 1 if len(self.strategy.split('-')) == 1 else int(self.strategy.split('-')[1]) 
+        
         inference_step_size = int(1 / self.retrain_rate) if self.retrain_rate > 0 else 1
         self.inferece_step_size = min(max(inference_step_size, steps_per_train), self.n_test_samples // 2) if self.n_test_samples > 0 else 1
+        print(f"\n[Strategy {self.strategy}] - inference sample {self.n_test_samples}, retrain rate {self.retrain_rate}, inference step size {self.inferece_step_size}\n")
         # self.inferece_step_size = 1 if len(self.strategy.split('-')) == 1 else int(self.strategy.split('-')[1]) 
 
         # Handle model paths and configurations
@@ -145,7 +151,7 @@ class EffiGenTune:
         return task_queue.qsize() == 1 and task_queue.queue[-1][-1] is None
 
     
-    def _periodic_iteration(
+    def sync_iteration(
         self,
         task_queues: List[IterQueue],
         preloaded_tasks: List[Task],
@@ -156,7 +162,7 @@ class EffiGenTune:
         """
         # print(f"[Iteration {records['iteration']}] current_prefills: {records['current_prefills']}, total_prefills: {records['total_prefills']}, train_queue: {task_queues[0].qsize()}, inference_queue: {task_queues[1].qsize()}")
         if (
-            records["current_prefills"] >= self.inferece_step_size or 
+            (records["current_prefills"] >= self.inferece_step_size and records["total_trains"] < records["total_prefills"] * self.retrain_rate) or 
             (records["total_prefills"] == self.n_test_samples and not self.check_termination(task_queues[0]))
         ):
         # if (
@@ -165,7 +171,7 @@ class EffiGenTune:
         # ):
             # For periodic retraining, we run retraining if the fixed interval is reached
             reach_end = True
-            print(f"\nStarting retraining while loop ...")
+            print(f"\nStart training (current prefills: {records['current_prefills']}, total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})...")
             while True:
                 if task_queues[0].qsize() == 0:
                     # If there is no retraining task, we can break the loop
@@ -192,10 +198,14 @@ class EffiGenTune:
                 # Execute the training tasks in the bin
                 bin.execute("train", self.model, self.tokenizer, task_queues[0], self.optimizer, memory_threshold=self.memory_threshold, **self.kwargs)
                 # print(f"[Iteration {records['iteration']}] scheduled training tasks: {training_tasks}, finished training tasks {bin.finished_training_tasks}")
+
+                with self.record_lock:
+                    records["total_trains"] += bin.finished_training_tasks
+
                 if bin.finished_training_tasks == training_tasks:
                     # If the bin has finished all training tasks, we can break the loop
                     break
-            print(f"End retraining while loop!!!\n")
+            print(f"End training!!!\n")
             # Reset the inference steps count after retraining as the remaining beyond the fixed interval is not counted
             with self.record_lock:
                 records["current_prefills"] -= min(self.inferece_step_size, records["current_prefills"])
@@ -237,12 +247,15 @@ class EffiGenTune:
     
 
 
-    def _continuous_iteration(
+    def async_iteration(
         self,
         task_queues: List[IterQueue],
         preloaded_tasks: List[Task],
         record_metrics: Dict[str, Any],
     ):
+        """
+        Continuous iteration for retraining tasks.
+        """
         # For sync or async strategy, we only need to check the first queue
         if task_queues[0].qsize() > 1:  # at least one retraining task (sync) or one task (async)
             if self.strategy == "async":
@@ -343,10 +356,11 @@ class EffiGenTune:
                 time.sleep(0.01)
                 continue
             try:
-                if self.strategy in {"sync", "async"}:
-                    reach_end = self._continuous_iteration(task_queues, preloaded_tasks, record_metrics)
+                # if self.strategy in {"sync", "async"}:
+                if self.strategy == "async":
+                    reach_end = self.async_iteration(task_queues, preloaded_tasks, record_metrics)
                 else:
-                    reach_end = self._periodic_iteration(task_queues, preloaded_tasks, record_metrics)
+                    reach_end = self.sync_iteration(task_queues, preloaded_tasks, record_metrics)
             except Exception as e:
                 print(f"Error during execution: {e}")
                 traceback.print_exc()
@@ -410,9 +424,9 @@ class EffiGenTune:
         record_metrics["iteration"] = 0
         record_metrics["tokens"] = 0
         record_metrics["inference_tokens"] = 0
-        if self.strategy not in {"sync", "async"}: 
-            record_metrics["current_prefills"] = 0
-            record_metrics["total_prefills"] = 0
+        record_metrics["current_prefills"] = 0
+        record_metrics["total_prefills"] = 0
+        record_metrics["total_trains"] = 0
 
         start = time.time()
 
@@ -438,7 +452,9 @@ class EffiGenTune:
             output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}_{self.layer_selection}-{self.layer_threshold}.json")
         else:
             output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
-        eval_metrics = self.compute_metrics([task for task in preloaded_tasks if task.workload != 'train'])
+
+        inference_tasks = [task for task in preloaded_tasks if task.workload != 'train']
+        eval_metrics = self.compute_metrics(inference_tasks)
         train_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'train' and "loss" in task.metrics]
         # inference_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'inference']
         metrics = {
@@ -446,13 +462,16 @@ class EffiGenTune:
             "retrain_rate": self.retrain_rate,
             "strategy": self.strategy,
             "num_test_samples": self.n_test_samples,
+            "actual_samples": {
+                "train": len(preloaded_tasks) - len(inference_tasks), 
+                "inference": len(inference_tasks),
+            },
             "iteration": record_metrics["iteration"],
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),
             "throughput_inference": record_metrics["inference_tokens"] / (end - start),
             "avg_decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,
             "train_loss": np.mean(train_losses) if train_losses else 0,
-            # "inference_loss": np.mean(inference_losses) if inference_losses else 0,
             "eval_metrics": eval_metrics,
             "generation_results": [
                 {
