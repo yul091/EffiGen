@@ -85,6 +85,8 @@ class Producer:
         tokenizer: AutoTokenizer,
         max_length: int,
         dataset_name: Union[str, List[str]] = "data/Anthropic",
+        batched: bool = True,
+        return_dataset: bool = False,
     ) -> List[Task]:
         """
         Load dataset and tokenize inputs. Create a preloaded dataset of Task objects.
@@ -146,12 +148,12 @@ class Producer:
 
         processed_test_dataset = test_dataset.map(
             tokenize_and_align_labels,
-            batched=True,
+            batched=batched,
             load_from_cache_file=False,
         ).remove_columns(test_dataset.column_names)
         processed_train_dataset = train_dataset.map(
             tokenize_and_align_labels, 
-            batched=True, 
+            batched=batched, 
             load_from_cache_file=False,
         ).remove_columns(train_dataset.column_names)
 
@@ -272,6 +274,8 @@ class Producer:
 
         # pdb.set_trace()
         print(f"  **  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  **")
+        if return_dataset:
+            return preloaded_tasks, processed_train_dataset, processed_test_dataset
         return preloaded_tasks
     
 

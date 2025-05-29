@@ -43,7 +43,6 @@ class Bin:
         self.eval_metrics = eval_metrics
         self.device = device
         self.strategy = strategy
-        self.finished_inference_tasks = 0
         self.finished_training_tasks = 0
         # Initialize memory and latency
         self.memory_capacity = torch.cuda.get_device_properties(device).total_memory / (1024**2)  # MB
@@ -97,6 +96,20 @@ class Bin:
         else:
             raise ValueError(f"Invalid target: {target}. Supported targets: all, inference, train.")
         
+        
+    def get_batch(self, workload: str) -> List[Task]:
+        """
+        Get the batch of tasks for the specified workload.
+        """
+        if workload == "prefill":
+            return self.prefill_batch
+        elif workload == "decode":
+            return self.decode_batch
+        elif workload == "train":
+            return self.train_batch
+        else:
+            raise ValueError(f"Invalid workload: {workload}. Supported workloads: prefill, decode, train.")
+        
 
     def get_workload(
         self, 
@@ -138,57 +151,55 @@ class Bin:
         return batch_memory, batch_latency, batch_length, memory_fit, latency_fit
         
 
-    @profile
-    def _create_batch(
-        self,
+    @staticmethod
+    def create_batch(
+        workload: str,
         batch: List[Task],
         tokenizer: LlamaTokenizer,
+        inference_input_feature: str = "input_ids",
+        inference_mask_feature: str = "attention_mask",
         batch_collator: Optional[DPOCollator] = None,
         device: Optional[str] = "cuda",
+        get_prefix_cache: Optional[Callable] = None,
     ):  
-        if not batch:
-            return None
         batch_collator = batch_collator if batch_collator is not None else DPOCollator(
             tokenizer, 
-            inference_input_feature=self.inference_input_feature, 
-            inference_mask_feature=self.inference_mask_feature,
+            inference_input_feature=inference_input_feature, 
+            inference_mask_feature=inference_mask_feature,
         )
         inputs = [task.input_kwargs for task in batch]
         inputs = batch_collator(inputs)
         inputs["past_key_values"] = None
 
+        # Handle prefix manager if provided
+        prefix_sizes = None
+        if workload != "decode" and get_prefix_cache is not None:
+            prefix_cache, prefix_sizes = get_prefix_cache(**inputs, padding_side=tokenizer.padding_side)
+            for i, task in enumerate(batch):
+                task.past_key_values = prefix_cache[i]
+            print(f"[INFO] Shared prefix sizes: {prefix_sizes}, KV Cache: {prefix_cache}")
+            inputs["prefix_sizes"] = prefix_sizes
+        task_caches = [task.past_key_values for task in batch]
+
         # Handle case where all caches are None
-        split_caches = [task.past_key_values for task in batch]
-        if all(c is None for c in split_caches):  
+        if all(c is None for c in task_caches):  
             return prepare_inputs(inputs, device=device)
 
         # For decode-only: pad key values with varient sequence lengths
-        ref_cache = next(c for c in split_caches if c is not None)
-        attention_mask = inputs[self.inference_mask_feature][:, :-1]  # Remove decode step
+        ref_cache = next(c for c in task_caches if c is not None)
+        if workload == "decode":
+            attention_mask = inputs[inference_mask_feature][:, :-1]  # Remove decode step
+        else:
+            attention_mask = inputs[inference_mask_feature]
         batch_size, max_seq_len = attention_mask.shape
         num_heads, _, head_dim  = ref_cache.key_cache[0].shape
         inputs["past_key_values"] = DynamicCache()
 
         valid_lens = attention_mask.sum(dim=1).tolist()
         pad_left = tokenizer.padding_side == "left"
-        non_empty = [(i, c) for i, c in enumerate(split_caches) if c is not None]
+        non_empty = [(i, c) for i, c in enumerate(task_caches) if c is not None]
 
         for layer_idx in range(len(ref_cache.key_cache)):
-            # key_tensor = torch.zeros(
-            #     (batch_size, num_heads, max_seq_len, head_dim),
-            #     dtype=ref_cache.key_cache[layer_idx].dtype,
-            #     device=ref_cache.key_cache[layer_idx].device,
-            # )
-            # value_tensor = torch.zeros_like(key_tensor)
-            # for i in range(batch_size):
-            #     if split_caches[i] is None:
-            #         continue  # Skip samples without KV cache (zero)
-            #     # print(f"Task {i} (output) cache size: {split_caches[i].key_cache[layer_idx].shape}")
-            #     mask = attention_mask[i] == 1
-            #     key_tensor[i, :, mask, :] = split_caches[i].key_cache[layer_idx]  # [H, valid_len, D]
-            #     value_tensor[i, :, mask, :] = split_caches[i].value_cache[layer_idx]
-            # inputs["past_key_values"].update(key_tensor, value_tensor, layer_idx)
-
             k_buf = torch.empty(
                 (batch_size, num_heads, max_seq_len, head_dim),
                 dtype=ref_cache.key_cache[layer_idx].dtype,
@@ -197,25 +208,34 @@ class Bin:
             v_buf = torch.empty_like(k_buf)
             for i, c in non_empty:
                 T_i = valid_lens[i]
-                if pad_left:
-                    target_slice = slice(max_seq_len - T_i, max_seq_len)
+                if workload == "decode":
+                    if pad_left:
+                        target_slice = slice(max_seq_len - T_i, max_seq_len)
+                    else:
+                        target_slice = slice(0, T_i)
                 else:
-                    target_slice = slice(0, T_i)
+                    P_i = prefix_sizes[i]
+                    if pad_left:
+                        target_slice = slice(max_seq_len - T_i, max_seq_len - T_i + P_i)
+                    else:
+                        target_slice = slice(0, P_i)
+                # print(f"[INFO] Task {i} ({workload}) - layer {layer_idx} - T_{i} {T_i}, P_{i} {P_i}, target_slice {target_slice}")
                 k_buf[i, :, target_slice, :] = c.key_cache[layer_idx]
                 v_buf[i, :, target_slice, :] = c.value_cache[layer_idx]
             inputs["past_key_values"].update(k_buf, v_buf, layer_idx)
             
         return prepare_inputs(inputs, device=device)
     
-    @profile
-    def _batch_decoding(
-        self,
+
+    @staticmethod
+    def batch_decoding(
         batch: List[Task],
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         lm_logits: torch.Tensor,
         task_queue: IterQueue,
         tokenizer: LlamaTokenizer,
+        strategy: str,
         do_sample: bool = False,
         logits_processor: Optional[Callable] = None,
         max_new_tokens: Optional[int] = None,
@@ -271,11 +291,10 @@ class Bin:
                         layer_idx=layer_idx,
                     )
                 # Add task back to queue
-                task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
+                task_queue.put((task.get_priority(strategy, initial=False), task.workload, task.taskID))
             else:  # stop decoding
                 # Update response (text) with next token
                 task.get_response(tokenizer)
-                self.finished_inference_tasks += 1
                 # Empty cache
                 task.past_key_values = None
                 
@@ -283,10 +302,9 @@ class Bin:
     @profile
     def execute(
         self,
-        batch: List[Task],
+        workload: str,
         model: LlamaForCausalLM,
         tokenizer: LlamaTokenizer,
-        workload: str,
         task_queue: IterQueue,
         optimizer: torch.optim.Optimizer,
         batch_collator: Optional[DPOCollator] = None,
@@ -295,13 +313,22 @@ class Bin:
         generation_config: Optional[GenerationConfig] = None,
         memory_threshold: Optional[float] = None,
         loss_threshold: Optional[float] = None,
-        layer_selection: Optional[str] = None,  # "RGN" or "SNR" or None
+        layer_selection: Optional[str] = None,  # "RGN", "SNR"
         layer_threshold: Optional[float] = None,
     ):
+        batch = self.get_batch(workload)
         if not batch:
             return 
-        
-        inputs = self._create_batch(batch, tokenizer, batch_collator=batch_collator, device=model.device)
+        loss_threshold = loss_threshold if loss_threshold is not None else 1.0
+        inputs = self.create_batch(
+            workload,
+            batch, 
+            tokenizer, 
+            inference_input_feature=self.inference_input_feature,
+            inference_mask_feature=self.inference_mask_feature,
+            batch_collator=batch_collator, 
+            device=model.device,
+        )
         memory_threshold = memory_threshold if memory_threshold is not None else 0.95
         
         # Check memory threshold
@@ -314,7 +341,6 @@ class Bin:
                 # Update task status and put it back to the queue
                 if task.workload == "decode":
                     task.get_response(tokenizer)
-                    self.finished_inference_tasks += 1
                     print(f"Drop decoding task {task.taskID} due to memory overflow.")
                 else:
                     task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
@@ -398,13 +424,14 @@ class Bin:
                         )
 
                 # Decode the next tokens and update task status
-                self._batch_decoding(
+                self.batch_decoding(
                     batch=batch,
                     input_ids=model_kwargs[self.inference_input_feature],
                     attention_mask=model_kwargs[self.inference_mask_feature],
                     lm_logits=outputs.logits,
                     task_queue=task_queue,
                     tokenizer=tokenizer,
+                    strategy=self.strategy,
                     do_sample=generation_config.do_sample,
                     logits_processor=logits_processor,
                     max_new_tokens=max_new_tokens,
@@ -442,40 +469,51 @@ class Bin:
         if self.strategy == "async":
             with ThreadPoolExecutor(max_workers=3) as executor:
                 # print(f"Concurrent execution (prioritize inference)!")
-                for workload, batch in [
-                    ("train", self.train_batch),
-                    ("prefill", self.prefill_batch),
-                    ("decode", self.decode_batch),
-                ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+                for workload in ["train", "prefill", "decode"]:
+                    executor.submit(
+                        self.execute, 
+                        workload, 
+                        model, 
+                        tokenizer, 
+                        task_queue, 
+                        optimizer, 
+                        memory_threshold=memory_threshold, 
+                        **kwargs,
+                    )
 
         else:
             # print(f"Sequantial execution (prioritize training)!")
             # Prioritize the training workload
-            # self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            # self.execute("train", model, tokenizer, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
             with ThreadPoolExecutor(max_workers=2) as executor:
-                for workload, batch in [
-                    ("prefill", self.prefill_batch),
-                    ("decode", self.decode_batch),
-                ]:
-                    executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+                for workload in ["prefill", "decode"]:
+                    executor.submit(
+                        self.execute, 
+                        workload, 
+                        model, 
+                        tokenizer, 
+                        task_queue, 
+                        optimizer, 
+                        memory_threshold=memory_threshold, 
+                        **kwargs,
+                    )
 
             # if self.strategy == "train-first" or self.strategy == "sync":
-            #     self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #     self.execute("train", model, tokenizer, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
             #     with ThreadPoolExecutor(max_workers=2) as executor:
             #         for workload, batch in [
             #             ("prefill", self.prefill_batch),
             #             ("decode", self.decode_batch),
             #         ]:
-            #             executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #             executor.submit(self.execute, workload, model, tokenizer, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
             # elif self.strategy == "test-first":
             #     with ThreadPoolExecutor(max_workers=2) as executor:
             #         for workload, batch in [
             #             ("prefill", self.prefill_batch),
             #             ("decode", self.decode_batch),
             #         ]:
-            #             executor.submit(self.execute, batch, model, tokenizer, workload, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
-            #     self.execute(self.train_batch, model, tokenizer, "train", task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #             executor.submit(self.execute, workload, model, tokenizer, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
+            #     self.execute("train", model, tokenizer, task_queue, optimizer, memory_threshold=memory_threshold, **kwargs)
             # else:
             #     raise ValueError(f"Invalid strategy: {self.strategy}. Supported strategies: train-first, test-first, async, sync.")
 

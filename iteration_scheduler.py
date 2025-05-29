@@ -99,3 +99,41 @@ class Scheduler:
 
 
 
+    def fifo_allocate(
+        self, 
+        task_queue: IterQueue, 
+        preloaded_tasks: List[Task],
+        iteration: int, 
+        model: AutoModelForCausalLM,
+        max_batch_size: int,
+        workload: str,
+        attn_implementation: str = "flash_attention_2",
+        eval_metrics: bool = False,
+    ) -> Tuple[Bin, bool]:
+        """
+        FIFO with predefined maximum batch sizes for a specific workload ('inference' or 'train').
+        We ensure that task_queue only contains one type of workload.
+        """
+        bin = None
+        reach_end = False
+        initial_qsize = task_queue.qsize()
+        while task_queue.qsize() > 0:
+            if bin is None:
+                # Create a new bin for the current workload
+                bin = Bin(self.strategy, device=model.device, eval_metrics=eval_metrics)
+            if bin.get_num_tasks(workload) == max_batch_size:
+                # Reached the maximum number of tasks for inference or training
+                break
+            _, _, taskID = task_queue.get()
+            if taskID is None:
+                # Reach the end of the preloaded tasks
+                task_queue.put((float('inf'), None, None))
+                reach_end = True
+                break
+            task: Task = preloaded_tasks[taskID]
+            # Add task to the bin
+            bin.add_task(task, model, attn_implementation=attn_implementation)
+
+        if bin is not None:
+            print(f"  **  [Iteration {iteration} | {workload}] queue size {initial_qsize} -- schedule {bin.get_num_tasks()} tasks (prefill {bin.get_num_tasks('prefill')}, decode {bin.get_num_tasks('decode')}, train {bin.get_num_tasks('train')})  **  ")
+        return bin, reach_end
