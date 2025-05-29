@@ -160,117 +160,119 @@ class Producer:
         # Preloaded tasks
         preloaded_tasks: List[Task] = []
 
-        # We use enqueue time as priority
-        if self.strategy == "train_first":  
-            # Train tasks first, then test tasks
-            for train_idx in range(self.n_train_samples):
-                task = Task(
-                    taskID=train_idx,
-                    workload="train", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=train_dataset[train_idx]["context"],
-                    input_kwargs=processed_train_dataset[train_idx],
-                    source_dataset=train_dataset[train_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
-            for test_idx in range(self.n_test_samples):
-                task = Task(
-                    taskID=test_idx + self.n_train_samples,
-                    workload="prefill", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=test_dataset[test_idx]["context"],
-                    input_kwargs=processed_test_dataset[test_idx],
-                    source_dataset=test_dataset[test_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
+        # # We use enqueue time as priority
+        # if self.strategy == "train_first":  
+        #     # Train tasks first, then test tasks
+        #     for train_idx in range(self.n_train_samples):
+        #         task = Task(
+        #             taskID=train_idx,
+        #             workload="train", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=train_dataset[train_idx]["context"],
+        #             input_kwargs=processed_train_dataset[train_idx],
+        #             source_dataset=train_dataset[train_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
+        #     for test_idx in range(self.n_test_samples):
+        #         task = Task(
+        #             taskID=test_idx + self.n_train_samples,
+        #             workload="prefill", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=test_dataset[test_idx]["context"],
+        #             input_kwargs=processed_test_dataset[test_idx],
+        #             source_dataset=test_dataset[test_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
 
-        # We use enqueue time as priority
-        elif self.strategy == "test_first":  
-            # Test tasks first, then train tasks
-            for test_idx in range(self.n_test_samples):
-                task = Task(
-                    taskID=test_idx,
-                    workload="prefill", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=test_dataset[test_idx]["context"],
-                    input_kwargs=processed_test_dataset[test_idx],
-                    source_dataset=test_dataset[test_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
-            for train_idx in range(self.n_train_samples):
-                task = Task(
-                    taskID=train_idx + self.n_test_samples,
-                    workload="train", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=train_dataset[train_idx]["context"],
-                    input_kwargs=processed_train_dataset[train_idx],
-                    source_dataset=train_dataset[train_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
+        # # We use enqueue time as priority
+        # elif self.strategy == "test_first":  
+        #     # Test tasks first, then train tasks
+        #     for test_idx in range(self.n_test_samples):
+        #         task = Task(
+        #             taskID=test_idx,
+        #             workload="prefill", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=test_dataset[test_idx]["context"],
+        #             input_kwargs=processed_test_dataset[test_idx],
+        #             source_dataset=test_dataset[test_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
+        #     for train_idx in range(self.n_train_samples):
+        #         task = Task(
+        #             taskID=train_idx + self.n_test_samples,
+        #             workload="train", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=train_dataset[train_idx]["context"],
+        #             input_kwargs=processed_train_dataset[train_idx],
+        #             source_dataset=train_dataset[train_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
 
-        # We use enqueue time as priority
-        elif self.strategy == "train_middle":  # split the test into halves, test - train - test
-            # Train tasks in the middle
-            for test_idx in range(self.n_test_samples // 2):
-                task = Task(
-                    taskID=test_idx,
-                    workload="prefill", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=test_dataset[test_idx]["context"],
-                    input_kwargs=processed_test_dataset[test_idx],
-                    source_dataset=test_dataset[test_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
-            for train_idx in range(self.n_train_samples):
-                task = Task(
-                    taskID=train_idx + test_idx + 1,
-                    workload="train", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=train_dataset[train_idx]["context"],
-                    input_kwargs=processed_train_dataset[train_idx],
-                    source_dataset=train_dataset[train_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
-            for second_test_idx in range(test_idx + 1, self.n_test_samples):
-                task = Task(
-                    taskID=second_test_idx + train_idx + 1,
-                    workload="prefill", 
-                    rate_lambda=self.arrival_rate, 
-                    prompt=test_dataset[second_test_idx]["context"],
-                    input_kwargs=processed_test_dataset[second_test_idx],
-                    source_dataset=test_dataset[second_test_idx]["source_dataset"],
-                )
-                preloaded_tasks.append(task)
-
+        # # We use enqueue time as priority
+        # elif self.strategy == "train_middle":  # split the test into halves, test - train - test
+        #     # Train tasks in the middle
+        #     for test_idx in range(self.n_test_samples // 2):
+        #         task = Task(
+        #             taskID=test_idx,
+        #             workload="prefill", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=test_dataset[test_idx]["context"],
+        #             input_kwargs=processed_test_dataset[test_idx],
+        #             source_dataset=test_dataset[test_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
+        #     for train_idx in range(self.n_train_samples):
+        #         task = Task(
+        #             taskID=train_idx + test_idx + 1,
+        #             workload="train", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=train_dataset[train_idx]["context"],
+        #             input_kwargs=processed_train_dataset[train_idx],
+        #             source_dataset=train_dataset[train_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
+        #     for second_test_idx in range(test_idx + 1, self.n_test_samples):
+        #         task = Task(
+        #             taskID=second_test_idx + train_idx + 1,
+        #             workload="prefill", 
+        #             rate_lambda=self.arrival_rate, 
+        #             prompt=test_dataset[second_test_idx]["context"],
+        #             input_kwargs=processed_test_dataset[second_test_idx],
+        #             source_dataset=test_dataset[second_test_idx]["source_dataset"],
+        #         )
+        #         preloaded_tasks.append(task)
+        # else: 
+ 
         # Periodic / Sync / Async
-        else:  
-            train_prob = self.retrain_rate / (self.retrain_rate + 1)
-            train_idx, test_idx = 0, 0
-            for taskID in range(self.n_train_samples + self.n_test_samples):
-                if (random.random() < train_prob and train_idx < self.n_train_samples) or (test_idx == self.n_test_samples):
-                    # Add a train task
-                    task = Task(
-                        taskID=taskID,
-                        workload="train", 
-                        rate_lambda=self.arrival_rate, 
-                        prompt=train_dataset[train_idx]["context"],
-                        input_kwargs=processed_train_dataset[train_idx],
-                        source_dataset=train_dataset[train_idx]["source_dataset"],
-                    )
-                    train_idx += 1
-                else:
-                    # Add a test task
-                    task = Task(
-                        taskID=taskID,
-                        workload="prefill", 
-                        rate_lambda=self.arrival_rate, 
-                        prompt=test_dataset[test_idx]["context"],
-                        input_kwargs=processed_test_dataset[test_idx],
-                        source_dataset=test_dataset[test_idx]["source_dataset"],
-                    )
-                    test_idx += 1
+        train_prob = self.retrain_rate / (self.retrain_rate + 1)
+        train_idx, test_idx = 0, 0
+        for taskID in range(self.n_train_samples + self.n_test_samples):
+            if (random.random() < train_prob and train_idx < self.n_train_samples) or (test_idx == self.n_test_samples):
+                # Add a train task
+                task = Task(
+                    taskID=taskID,
+                    workload="train", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=train_dataset[train_idx]["context"],
+                    reference=train_dataset[train_idx]["chosen_response"],
+                    input_kwargs=processed_train_dataset[train_idx],
+                    source_dataset=train_dataset[train_idx]["source_dataset"],
+                )
+                train_idx += 1
+            else:
+                # Add a test task
+                task = Task(
+                    taskID=taskID,
+                    workload="prefill", 
+                    rate_lambda=self.arrival_rate, 
+                    prompt=test_dataset[test_idx]["context"],
+                    reference=test_dataset[test_idx]["chosen_response"],
+                    input_kwargs=processed_test_dataset[test_idx],
+                    source_dataset=test_dataset[test_idx]["source_dataset"],
+                )
+                test_idx += 1
 
-                preloaded_tasks.append(task)
+            preloaded_tasks.append(task)
 
         # pdb.set_trace()
         print(f"\n====  Loaded {len(preloaded_tasks)} tasks - {len(processed_test_dataset)} test ({len(processed_test_dataset) * 100 / len(preloaded_tasks):.2f}%) and {len(processed_train_dataset)} train ({len(processed_train_dataset) * 100 / len(preloaded_tasks):.2f}%)  ====\n")

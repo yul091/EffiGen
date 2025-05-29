@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any, Callable
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from line_profiler import profile
 from transformers import (
     LlamaTokenizer,
@@ -252,10 +253,13 @@ class Bin:
         next_token_scores = logits_processor(input_ids, next_token_logits)
         # Token selection
         if do_sample:
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            probs = F.softmax(next_token_scores, dim=-1)  # [B, V]
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
         else:
             next_tokens = torch.argmax(next_token_scores, dim=-1)  # Greedy decoding (B)
+        # Calculate NLL for perplexity
+        log_probs = F.log_softmax(next_token_scores, dim=-1)  # [B, V]
+        nlls = -log_probs[torch.arange(batch_size, device=log_probs.device), next_tokens]  # [B]
         # Update unfinished sequences
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=lm_logits.device)
         unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(tokenizer.eos_token_id).long())
@@ -264,7 +268,7 @@ class Bin:
     
         # Update task status
         for i, task in enumerate(batch):
-            task.update_decoding(next_tokens[i].item())
+            task.update_decoding(next_tokens[i].item(), nll=nlls[i].item())
             # if unfinished_sequences[i] == 1 and stoppings[i] == True:  # continue decoding
             if unfinished_sequences[i] == 1 and task.step < max_new_tokens: # continue decoding
                 # Update past key values [batch_size, num_heads, seq_len, head_dim]
@@ -295,6 +299,8 @@ class Bin:
             else:  # stop decoding
                 # Update response (text) with next token
                 task.get_response(tokenizer)
+                # Calculate generation metrics 
+                
                 # Empty cache
                 task.past_key_values = None
                 
@@ -446,7 +452,6 @@ class Bin:
             for task in batch:
                 if task.execution_time is None:
                     task.execution_time = execution_time
-                # task.response = error_msg
                 if task.workload != "train":
                     task.get_response(tokenizer)
                 task.metrics["error"] = str(e)

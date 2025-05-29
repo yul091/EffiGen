@@ -19,7 +19,7 @@ from iteration_scheduler import Scheduler
 from iteration_queue import IterQueue, heapify
 from iteration_prefix import PrefixManager
 from alignment_study import DPOCollator
-from utils import save_metrics_with_order
+from utils import save_metrics_with_order, compute_generation_metrics
 
 
 
@@ -162,13 +162,9 @@ class EffiGenTune:
         """
         # print(f"[Iteration {records['iteration']}] current_prefills: {records['current_prefills']}, total_prefills: {records['total_prefills']}, train_queue: {task_queues[0].qsize()}, inference_queue: {task_queues[1].qsize()}")
         if (
-            (records["current_prefills"] >= self.inferece_step_size and records["total_trains"] < records["total_prefills"] * self.retrain_rate) or 
-            (records["total_prefills"] == self.n_test_samples and not self.check_termination(task_queues[0]))
+            ((records["current_prefills"] >= self.inferece_step_size and records["total_trains"] < records["total_prefills"] * self.retrain_rate) or (records["total_prefills"] == self.n_test_samples)) 
+            and not self.check_termination(task_queues[0])
         ):
-        # if (
-        #     (records["iteration"] + 1) % self.inferece_step_size == 0 or 
-        #     (records["total_prefills"] == self.n_test_samples and not self.check_termination(task_queues[0]))
-        # ):
             # For periodic retraining, we run retraining if the fixed interval is reached
             reach_end = True
             print(f"\nStart training (current prefills: {records['current_prefills']}, total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})...")
@@ -462,15 +458,15 @@ class EffiGenTune:
             "retrain_rate": self.retrain_rate,
             "strategy": self.strategy,
             "num_test_samples": self.n_test_samples,
-            "actual_samples": {
-                "train": len(preloaded_tasks) - len(inference_tasks), 
-                "inference": len(inference_tasks),
+            "executed_samples": {
+                "train": record_metrics["total_trains"], 
+                "inference": record_metrics["total_prefills"],
             },
             "iteration": record_metrics["iteration"],
             "total_time": end - start,
             "throughput": record_metrics["tokens"] / (end - start),
             "throughput_inference": record_metrics["inference_tokens"] / (end - start),
-            "avg_decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,
+            "decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,
             "train_loss": np.mean(train_losses) if train_losses else 0,
             "eval_metrics": eval_metrics,
             "generation_results": [
@@ -478,6 +474,7 @@ class EffiGenTune:
                     "taskID": task.taskID,
                     "workload": task.workload,
                     "prompt": task.prompt,
+                    "prompt_length": task.prompt_length,
                     "response": task.response,
                     "step": task.step,
                     "metrics": task.metrics,
@@ -500,17 +497,28 @@ class EffiGenTune:
         total_log_prob_diff = 0.0
         total_perplexity = 0.0
         total_loss = 0.0
+        total_rougeL = 0.0
+        total_bleu = 0.0
 
         for task in tqdm(preloaded_tasks, desc="Averaging metrics", total=len(preloaded_tasks)):
             if task.workload == "train":
                 continue
             eval_outputs = task.metrics
             try:
-                total_loss += eval_outputs["loss"]
-                total_perplexity += eval_outputs["perplexity"]
-                total_correct += eval_outputs["correct_preds"]
                 total_samples += 1
+                total_loss += eval_outputs["loss"]
+                total_correct += eval_outputs["correct_preds"]
                 total_log_prob_diff += eval_outputs["log_prob_diff"]
+                # Generation metrics
+                ppl = eval_outputs["nll_sum"] / task.step if task.step > 0 else 0
+                total_perplexity += np.exp(ppl)
+                gen_metrics = compute_generation_metrics(
+                    hypothesis=task.response, 
+                    reference=task.reference,
+                )
+                total_rougeL += gen_metrics["rougeL"]
+                total_bleu += gen_metrics["bleu"]
+
             except KeyError as e:
                 print(f"KeyError: {e} in task {task.taskID}. Skipping this task.")
                 continue
@@ -520,12 +528,16 @@ class EffiGenTune:
         avg_clpd = total_log_prob_diff / total_samples if total_samples > 0 else 0
         avg_perplexity = total_perplexity / total_samples if total_samples > 0 else 0
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        avg_rougeL = total_rougeL / total_samples if total_samples > 0 else 0
+        avg_bleu = total_bleu / total_samples if total_samples > 0 else 0
 
         return {
-            "preference accuracy": preference_accuracy,
-            "contrastive log probability difference (CLPD)": avg_clpd,
-            "perplexity": avg_perplexity,
             "loss": avg_loss,
+            "preference accuracy": preference_accuracy,
+            "CLPD": avg_clpd,
+            "PPL": avg_perplexity,
+            "rougeL": avg_rougeL,
+            "bleu": avg_bleu,
         }
         
 

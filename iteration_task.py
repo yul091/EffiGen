@@ -16,6 +16,7 @@ class Task:
         workload: str,
         rate_lambda: float,
         prompt: Optional[str] = None,
+        reference: Optional[str] = None,
         input_kwargs: Optional[Dict[str, List[Any]]] = None,
         past_key_values: Optional[DynamicCache] = None,
         coefficients: Optional[Dict[str, Dict[str, float]]] = None,
@@ -27,6 +28,7 @@ class Task:
         workload (str): prefill, decode, or train.
         rate_lambda (float): expected request rate of a Poisson process.
         prompt (str): text prompt for the task.
+        reference (str): chosen response or response for the task.
         input_kwargs (Dict[str, Any]): tokenized input for the task.
         past_key_values (DynamicCache): cached key-values for the task.
         """
@@ -42,6 +44,7 @@ class Task:
         self.workload = workload
         self.rate_lambda = rate_lambda
         self.prompt = prompt
+        self.reference = reference
         self.source_dataset = source_dataset
         # Changable attributes
         self.input_kwargs = input_kwargs if input_kwargs is not None else {}
@@ -50,7 +53,8 @@ class Task:
         self.step = 0
         self.release_time = None
         self.execution_time = None
-        self.decode_times = []
+        if workload == "prefill":
+            self.decode_times = []
         self.response = ""
         self.metrics = {}
 
@@ -68,13 +72,18 @@ class Task:
                 priority = self.coefficients[self.workload]["base_priority"] + self.coefficients[self.workload]["priority_factor"] * (time.time() - self.release_time)
         return priority
     
-    def update_decoding(self, next_token: int):
+    def update_decoding(self, next_token: int, nll: Optional[float] = None):
         self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode
         self.step += 1
         self.decode_times.append(time.time())
         # Update the input_kwargs
-        self.input_kwargs[self.CONTEXT_FEATURE].append(next_token)
-        self.input_kwargs[self.CONTEXT_MASK].append(1)
+        self.input_kwargs[self.CONTEXT_FEATURE].append(next_token)  # input_ids
+        self.input_kwargs[self.CONTEXT_MASK].append(1)  # attention_mask
+        # Update NLL sum if provided
+        if nll is not None:
+            if "nll_sum" not in self.metrics:
+                self.metrics["nll_sum"] = 0.0
+            self.metrics["nll_sum"] += nll
         
     def get_response(
         self, 

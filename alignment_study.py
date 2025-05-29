@@ -323,12 +323,13 @@ def compute_batch_loss(
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), 
             shift_labels.view(-1),
-        )  # shape: (batch_size * (seq_length - 1))
+        )  # shape: (B * (T - 1))
         # Reshape to (batch_size, seq_length - 1)
-        per_token_loss = loss.view(shift_labels.shape)  # shape: (batch_size, seq_length - 1)
+        per_token_loss = loss.view(shift_labels.shape)  # shape: (B, T - 1)
         # Compute token-wise mean loss per sequence (batch_size,)
-        loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (batch_size, seq_length - 1)
-        per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (batch_size,)
+        loss_mask = shift_labels.ne(-100).float()  # # Mask out padding tokens -> shape: (B, T - 1)
+        # Normalize the loss across tokens
+        per_sample_loss = (per_token_loss * loss_mask).sum(dim=1) / loss_mask.sum(dim=1)  # shape: (B,)
     return per_sample_loss
 
 
@@ -351,8 +352,8 @@ def compute_batch_metrics(
             labels=batch[chosen_labels_feature],
         )
         chosen_loss = outputs.loss
-        # Compute perplexity (exp(loss))
-        chosen_ppl = torch.exp(chosen_loss)
+        # # Compute perplexity (exp(loss))
+        # chosen_ppl = torch.exp(chosen_loss)
         # For Preference Accuracy & CLPD
         chosen_logits = outputs.logits[:, -1, :]
         rejected_logits = model(
@@ -370,7 +371,7 @@ def compute_batch_metrics(
 
         return {
             "loss": chosen_loss.item(),
-            "perplexity": chosen_ppl.item(),
+            # "perplexity": chosen_ppl.item(),
             "correct_preds": correct_preds.item(),
             "batch_samples": chosen_probs.shape[0],
             "log_prob_diff": log_prob_diff.item(),
@@ -382,7 +383,7 @@ def compute_batch_metrics(
             attention_mask=batch[chosen_mask_feature],
         )
         chosen_loss = compute_batch_loss(outputs.logits, batch[chosen_labels_feature])
-        chosen_ppl = torch.exp(chosen_loss)
+        # chosen_ppl = torch.exp(chosen_loss)
         # For Preference Accuracy & CLPD
         chosen_logits = outputs.logits[:, -1, :]  # shape: (batch_size, vocab_size)
         rejected_logits = model(
@@ -400,7 +401,7 @@ def compute_batch_metrics(
 
         return {
             "loss": chosen_loss,
-            "perplexity": chosen_ppl,
+            # "perplexity": chosen_ppl,
             "correct_preds": correct_preds,
             # "batch_samples": chosen_probs.shape[0],
             "log_prob_diff": log_prob_diff,
@@ -415,7 +416,7 @@ def compute_metrics(model, dataloader, device):
     total_correct = 0
     total_samples = 0
     total_log_prob_diff = 0.0
-    total_perplexity = 0.0
+    # total_perplexity = 0.0
     total_loss = 0.0
 
     
@@ -424,7 +425,7 @@ def compute_metrics(model, dataloader, device):
         eval_outputs = compute_batch_metrics(model, batch)
 
         total_loss += eval_outputs["loss"]
-        total_perplexity += eval_outputs["perplexity"]
+        # total_perplexity += eval_outputs["perplexity"]
         total_correct += eval_outputs["correct_preds"]
         total_samples += eval_outputs["batch_samples"]
         total_log_prob_diff += eval_outputs["log_prob_diff"]
@@ -432,7 +433,7 @@ def compute_metrics(model, dataloader, device):
     # Compute final averages
     preference_accuracy = total_correct / total_samples
     avg_clpd = total_log_prob_diff / len(dataloader)
-    avg_perplexity = total_perplexity / len(dataloader)
+    # avg_perplexity = total_perplexity / len(dataloader)
     avg_loss = total_loss / len(dataloader)
     # avg_perplexity = total_perplexity / total_samples
     # avg_loss = total_loss / total_samples
@@ -440,7 +441,7 @@ def compute_metrics(model, dataloader, device):
     return {
         "Preference accuracy": preference_accuracy,
         "Contrastive log probability difference (CLPD)": avg_clpd,
-        "Perplexity": avg_perplexity,
+        # "Perplexity": avg_perplexity,
         "Loss": avg_loss,
     }
 

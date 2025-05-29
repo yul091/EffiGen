@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 from collections import OrderedDict
 import json
 import torch
-
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 
 def _prepare_input(
@@ -119,30 +120,47 @@ def plot_distributions(distribution, ax, fig, xrange=None, yrange=None, Zmin=Non
     ax.tick_params(axis='both', which='both', length=0)
 
 
+def compute_generation_metrics(hypothesis: str, reference: str) -> dict:
+    # ROUGE-L
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    rouge_l = scorer.score(reference, hypothesis)["rougeL"].fmeasure
 
-class Task:
-    def __init__(
-        self, 
-        task_id: int, 
-        input_ids: List[int], 
-        attention_mask: List[int],
-        rate_lambda: float,
-        labels: Optional[List[int]] = None,  
-        require_training: Optional[bool] = None,
-    ):
-        self.task_id = task_id
-        self.input_ids = input_ids
-        self.prompt_ids = input_ids.copy()
-        self.attention_mask = attention_mask
-        self.rate_lambda = rate_lambda
-        self.labels = labels
-        self.require_training = False if require_training is None else require_training
-        # self.hybrid_batch = None
-        # Define do_backward for selective training: initially set to require_training
-        self.do_backward = False if require_training is None else require_training
-        # self.start = start
-        self.decode_step = 0
-        # self.batch_decode_steps = []
+    # BLEU
+    ref_tokens = reference.split()
+    hyp_tokens = hypothesis.split()
+    smoothie = SmoothingFunction().method4
+    bleu_score = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smoothie)
+
+    return {
+        "rougeL": rouge_l,
+        "bleu": bleu_score,
+    }
+
+
+
+# class Task:
+#     def __init__(
+#         self, 
+#         task_id: int, 
+#         input_ids: List[int], 
+#         attention_mask: List[int],
+#         rate_lambda: float,
+#         labels: Optional[List[int]] = None,  
+#         require_training: Optional[bool] = None,
+#     ):
+#         self.task_id = task_id
+#         self.input_ids = input_ids
+#         self.prompt_ids = input_ids.copy()
+#         self.attention_mask = attention_mask
+#         self.rate_lambda = rate_lambda
+#         self.labels = labels
+#         self.require_training = False if require_training is None else require_training
+#         # self.hybrid_batch = None
+#         # Define do_backward for selective training: initially set to require_training
+#         self.do_backward = False if require_training is None else require_training
+#         # self.start = start
+#         self.decode_step = 0
+#         # self.batch_decode_steps = []
 
 
 def record_time(
