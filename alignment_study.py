@@ -5,6 +5,7 @@ import json
 from typing import List, Dict, Any, Union, Optional
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -448,8 +449,11 @@ def compute_metrics(model, dataloader, device):
 
 
 # === DPO Loss Function ===
-def dpo_loss(model, batch, beta=0.1, return_average=True):
+def dpo_loss(model: nn.Module, batch: Dict[str, Any], beta: float = 0.1, return_average: bool = True):
     """Computes DPO contrastive loss from logits"""
+    # Check if input length is larger than 1000, otherwise return None 
+    if batch["chosen_input_ids"].shape[1] > 1000 or batch["rejected_input_ids"].shape[1] > 1000:
+        return None
     chosen_logits = model(input_ids=batch["chosen_input_ids"], attention_mask=batch["chosen_attention_mask"]).logits
     rejected_logits = model(input_ids=batch["rejected_input_ids"], attention_mask=batch["rejected_attention_mask"]).logits
 

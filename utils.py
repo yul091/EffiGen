@@ -1,6 +1,7 @@
 
 from typing import Any, Dict, Optional, List, Union
 from collections.abc import Mapping
+from transformers import LlamaTokenizer
 from transformers.cache_utils import DynamicCache
 import time
 import numpy as np
@@ -120,14 +121,19 @@ def plot_distributions(distribution, ax, fig, xrange=None, yrange=None, Zmin=Non
     ax.tick_params(axis='both', which='both', length=0)
 
 
-def compute_generation_metrics(hypothesis: str, reference: str) -> dict:
+def compute_generation_metrics(hypothesis: str, reference: str, tokenizer: Optional[LlamaTokenizer] = None) -> dict:
     # ROUGE-L
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True, tokenizer=tokenizer)
     rouge_l = scorer.score(reference, hypothesis)["rougeL"].fmeasure
-
     # BLEU
-    ref_tokens = reference.split()
-    hyp_tokens = hypothesis.split()
+    if tokenizer is not None:
+        # Tokenize using the provided tokenizer
+        ref_tokens = tokenizer.tokenize(reference, add_special_tokens=False)
+        hyp_tokens = tokenizer.tokenize(hypothesis, add_special_tokens=False)
+    else:
+        # Fallback to simple whitespace tokenization
+        ref_tokens = reference.strip().split()
+        hyp_tokens = hypothesis.strip().split()
     smoothie = SmoothingFunction().method4
     bleu_score = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smoothie)
 

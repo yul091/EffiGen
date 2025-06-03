@@ -321,6 +321,7 @@ class Bin:
         loss_threshold: Optional[float] = None,
         layer_selection: Optional[str] = None,  # "RGN", "SNR"
         layer_threshold: Optional[float] = None,
+        logger: Optional[Callable] = None,
     ):
         batch = self.get_batch(workload)
         if not batch:
@@ -340,14 +341,16 @@ class Bin:
         # Check memory threshold
         preallocated_memory = torch.cuda.memory_allocated(model.device) / (1024**2)  # MB
         if preallocated_memory > memory_threshold * self.memory_capacity:
-            logging.warning(f"Memory overflow! Preallocate: {preallocated_memory:.2f} MB, capacity: {self.memory_capacity:.2f} MB")
+            if logger is not None:
+                logger(f"Memory overflow! Preallocate: {preallocated_memory:.2f} MB, capacity: {self.memory_capacity:.2f} MB")
             for task in batch:
                 # Offload the cache to CPU
                 task.past_key_values = _prepare_input(task.past_key_values, device="cpu")
                 # Update task status and put it back to the queue
                 if task.workload == "decode":
                     task.get_response(tokenizer)
-                    print(f"Drop decoding task {task.taskID} due to memory overflow.")
+                    if logger is not None:
+                        logger(f"Drop decoding task {task.taskID} due to memory overflow.")
                 else:
                     task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
             # Clear the batch
@@ -360,6 +363,19 @@ class Bin:
                 model.train()
                 optimizer.zero_grad()
                 losses = dpo_loss(model, inputs, return_average=False)
+
+                if losses is None:
+                    if logger is not None:
+                        logger(f"Context is longer than 1000 for current training batch {batch}. Dropping!")
+                    for task in batch:
+                        task.metrics["loss"] = 0.0
+                        if task.execution_time is None:
+                            task.execution_time = execution_time
+                        task.step += 1
+                        self.finished_training_tasks += 1
+                    # Clear the batch
+                    batch.clear()
+                    return
                 
                 # Handle selective training
                 if layer_selection is not None:
@@ -447,8 +463,8 @@ class Bin:
                 del outputs, inputs, model_kwargs, model_inputs
 
         except Exception as e:
-            error_msg = f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}"
-            logging.error(error_msg)
+            if logger is not None:
+                logger(f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}")
             for task in batch:
                 if task.execution_time is None:
                     task.execution_time = execution_time
@@ -469,6 +485,7 @@ class Bin:
         task_queue: IterQueue,
         optimizer: torch.optim.Optimizer,
         memory_threshold: Optional[float] = None,
+        logger: Optional[Callable] = None,
         **kwargs,
     ):
         if self.strategy == "async":
@@ -483,6 +500,7 @@ class Bin:
                         task_queue, 
                         optimizer, 
                         memory_threshold=memory_threshold, 
+                        logger=logger,
                         **kwargs,
                     )
 
@@ -500,6 +518,7 @@ class Bin:
                         task_queue, 
                         optimizer, 
                         memory_threshold=memory_threshold, 
+                        logger=logger,
                         **kwargs,
                     )
 

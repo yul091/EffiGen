@@ -53,8 +53,7 @@ class Task:
         self.step = 0
         self.release_time = None
         self.execution_time = None
-        if workload == "prefill":
-            self.decode_times = []
+        self.decode_times = []
         self.response = ""
         self.metrics = {}
 
@@ -63,14 +62,15 @@ class Task:
         if initial:
             self.release_time = time.time()
 
-        if strategy != "async":
-            priority = self.taskID
-        else:
-            if initial:
-                priority = self.coefficients[self.workload]["base_priority"]   
-            else:
-                priority = self.coefficients[self.workload]["base_priority"] + self.coefficients[self.workload]["priority_factor"] * (time.time() - self.release_time)
-        return priority
+        return self.taskID  # For FIFO, we use taskID as the priority
+        # if strategy != "async":
+        #     priority = self.taskID
+        # else:
+        #     if initial:
+        #         priority = self.coefficients[self.workload]["base_priority"]   
+        #     else:
+        #         priority = self.coefficients[self.workload]["base_priority"] + self.coefficients[self.workload]["priority_factor"] * (time.time() - self.release_time)
+        # return priority
     
     def update_decoding(self, next_token: int, nll: Optional[float] = None):
         self.workload = "decode" if self.workload == "prefill" else self.workload  # prefill -> decode

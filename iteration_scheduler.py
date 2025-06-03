@@ -1,5 +1,6 @@
 # A definition of the Scheduler class and supported functions.
-from typing import List, Tuple, Optional
+import logging
+from typing import List, Tuple, Optional, Callable
 from transformers import AutoModelForCausalLM
 import sys 
 sys.dont_write_bytecode = True
@@ -37,6 +38,10 @@ class Scheduler:
         eval_metrics: bool = False,
         memory_threshold: float = 0.95,
         task_limit: int = 50,
+        max_train_batch_size: int = 2,
+        max_inference_batch_size: int = 50,
+        logger: Optional[Callable] = None,
+        decode_only: bool = False,
     ) -> Tuple[Bin, bool]:
         """
         Priority-aware best-fit bin packing considering both memory & latency.
@@ -46,6 +51,7 @@ class Scheduler:
         reach_end = False
         initial_qsize, itrain, iprefill, idecode = task_queue.qsize(), task_queue.train_size, task_queue.prefill_size, task_queue.decode_size
         task_count, strain, sprefill, sdecode = 0, 0, 0, 0
+        # skipped_tasks = []  
         while task_queue.qsize() > 0:
             if task_count >= task_limit or (bins and self.memory_saturation(bins[0], memory_threshold)):
                 break
@@ -55,8 +61,13 @@ class Scheduler:
                 task_queue.put((float('inf'), None, None))  # Put back the end signal since we may have unfinished decoding tasks
                 reach_end = True
                 break
-            # print(f"  ** [Task {taskID}] - total preloaded tasks {len(preloaded_tasks)}...  **")
+            
             task: Task = preloaded_tasks[taskID]
+            # if decode_only and task.workload != "decode":
+            #     # task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
+            #     skipped_tasks.append(task)
+            #     continue
+
             task_count += 1
             if task.workload == "train":
                 strain += 1
@@ -64,10 +75,16 @@ class Scheduler:
                 sprefill += 1
             elif task.workload == "decode":
                 sdecode += 1
-            best_bin, best_score = None, float('inf')
 
+            
+            best_bin, best_score = None, float('inf')
             for idx, bin in enumerate(bins):
                 # Check if the bin can accommodate the task
+                if idx == 0 and task.workload == "train" and bin.get_num_tasks("train") >= max_train_batch_size:
+                    continue
+                if idx == 0 and task.workload != "train" and bin.get_num_tasks("inference") >= max_inference_batch_size:
+                    continue
+
                 _, _, _, memory_fit, latency_fit = bin.get_workload(task, model, attn_implementation=attn_implementation)
                 # print(f"  **  [Iteration {iteration} - Scheduling task {taskID} ({task.workload})] - (seq_len {batch_length}, memory {batch_memory:.2f}, latency {batch_latency:.2f}) - bin {idx} (base memory {bin.base_memory:.2f}, memory capacity {bin.memory_capacity}, max latency {bin.max_latency:.2f}, workload stats {bin.workload_stats}) - memory fit {memory_fit:.2f} / latency fit {latency_fit:.2f}  **")
                 if memory_fit > 0:
@@ -86,9 +103,20 @@ class Scheduler:
                 bins.append(new_bin)
                 # print(f" - Task {taskID} ({task.workload}) is assigned to bin {bins.index(new_bin)} (with accum memory {new_bin.total_memory} and max latency {new_bin.max_latency})")
 
+            # if decode_only:
+            #     if bins and bins[0].get_num_tasks("inference") >= max_inference_batch_size:
+            #         break
+
         # Put the remaining tasks (from remaining bin (if exists)) back into the queue
         if bins:
-            print(f"  **  [Iteration {iteration}] queue size {initial_qsize} (prefill {iprefill}, decode {idecode}, train {itrain}) --- involve {task_count} tasks (prefill {sprefill}, decode {sdecode}, train {strain}) --- schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}) --- {len(bins)} bins created  **  ")
+            # print(f"  **  [Iteration {iteration}] queue size {initial_qsize} (prefill {iprefill}, decode {idecode}, train {itrain}) --- involve {task_count} tasks (prefill {sprefill}, decode {sdecode}, train {strain}) --- schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}) --- {len(bins)} bins created  **  ")
+            if logger is not None:
+                # mode = "decode-only" if decode_only else "hybrid"
+                logger(f"  **  [Iteration {iteration}] queue size {initial_qsize} (prefill {iprefill}, decode {idecode}, train {itrain}) --- involve {task_count} tasks (prefill {sprefill}, decode {sdecode}, train {strain}) --- schedule {bins[0].get_num_tasks()} tasks (prefill {len(bins[0].prefill_batch)}, decode {len(bins[0].decode_batch)}, train {len(bins[0].train_batch)}) --- {len(bins)} bins created  **  ")
+        
+        # End of loop
+        # for task in skipped_tasks:
+        #     task_queue.put((task.get_priority(self.strategy, initial=False), task.workload, task.taskID))
         if len(bins) > 1:
             for i in range(1, len(bins)):
                 for task in bins[i].prefill_batch + bins[i].decode_batch + bins[i].train_batch:
@@ -109,6 +137,7 @@ class Scheduler:
         workload: str,
         attn_implementation: str = "flash_attention_2",
         eval_metrics: bool = False,
+        logger: Optional[Callable] = None,
     ) -> Tuple[Bin, bool]:
         """
         FIFO with predefined maximum batch sizes for a specific workload ('inference' or 'train').
@@ -135,5 +164,7 @@ class Scheduler:
             bin.add_task(task, model, attn_implementation=attn_implementation)
 
         if bin is not None:
-            print(f"  **  [Iteration {iteration} | {workload}] queue size {initial_qsize} -- schedule {bin.get_num_tasks()} tasks (prefill {bin.get_num_tasks('prefill')}, decode {bin.get_num_tasks('decode')}, train {bin.get_num_tasks('train')})  **  ")
+            # print(f"  **  [Iteration {iteration} | {workload}] queue size {initial_qsize} -- schedule {bin.get_num_tasks()} tasks (prefill {bin.get_num_tasks('prefill')}, decode {bin.get_num_tasks('decode')}, train {bin.get_num_tasks('train')})  **  ")
+            if logger is not None:
+                logger(f"  **  [Iteration {iteration} | {workload}] queue size {initial_qsize} -- schedule {bin.get_num_tasks()} tasks (prefill {bin.get_num_tasks('prefill')}, decode {bin.get_num_tasks('decode')}, train {bin.get_num_tasks('train')})  **  ")
         return bin, reach_end

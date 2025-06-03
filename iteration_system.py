@@ -2,6 +2,7 @@
 import os
 from typing import List, Optional, Dict, Any
 import time
+import logging
 import traceback
 import numpy as np
 import torch
@@ -55,7 +56,6 @@ class EffiGenTune:
         
         inference_step_size = int(1 / self.retrain_rate) if self.retrain_rate > 0 else 1
         self.inferece_step_size = min(max(inference_step_size, steps_per_train), self.n_test_samples // 2) if self.n_test_samples > 0 else 1
-        print(f"\n[Strategy {self.strategy}] - inference sample {self.n_test_samples}, retrain rate {self.retrain_rate}, inference step size {self.inferece_step_size}\n")
         # self.inferece_step_size = 1 if len(self.strategy.split('-')) == 1 else int(self.strategy.split('-')[1]) 
 
         # Handle model paths and configurations
@@ -77,6 +77,9 @@ class EffiGenTune:
         self.output_dir = args.output_dir
         self.memory_threshold = args.memory_threshold
         self.task_limit = args.task_limit
+        self.decode_only_threshold = args.decode_only_threshold
+        if self.decode_only_threshold < 1:
+            raise ValueError("decode_only_threshold must be at least 1, got {self.decode_only_threshold}")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, padding_side="left", use_fast=True)
@@ -142,6 +145,18 @@ class EffiGenTune:
             "layer_threshold": self.layer_threshold,
         }
 
+        self.start_time = time.time()  # Record the start time for logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(levelname)s] %(message)s',  # 不用 asctime，提高性能
+        )
+        self.log_with_time(f"[Strategy {self.strategy}] - inference sample {self.n_test_samples}, retrain rate {self.retrain_rate}, inference step size {self.inferece_step_size}\n")
+
+
+    def log_with_time(self, msg: str):
+        elapsed = time.time() - self.start_time
+        logging.info(f"[+{elapsed:.2f}s] {msg}")
+
 
     def check_termination(self, task_queue: IterQueue) -> bool:
         """
@@ -167,7 +182,7 @@ class EffiGenTune:
         ):
             # For periodic retraining, we run retraining if the fixed interval is reached
             reach_end = True
-            print(f"\nStart training (current prefills: {records['current_prefills']}, total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})...")
+            self.log_with_time(f"Start training (current prefills: {records['current_prefills']}, total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})")
             while True:
                 if task_queues[0].qsize() == 0:
                     # If there is no retraining task, we can break the loop
@@ -181,6 +196,7 @@ class EffiGenTune:
                     workload="train",
                     attn_implementation=self.attn_implementation,
                     eval_metrics=True,
+                    logger=self.log_with_time,
                 )
                 if bin is None:
                     # No suitable bin found, continue to the next iteration
@@ -192,7 +208,16 @@ class EffiGenTune:
                     records["iteration"] += 1
 
                 # Execute the training tasks in the bin
-                bin.execute("train", self.model, self.tokenizer, task_queues[0], self.optimizer, memory_threshold=self.memory_threshold, **self.kwargs)
+                bin.execute(
+                    "train", 
+                    self.model, 
+                    self.tokenizer, 
+                    task_queues[0], 
+                    self.optimizer, 
+                    memory_threshold=self.memory_threshold, 
+                    logger=self.log_with_time,
+                    **self.kwargs,
+                )
                 # print(f"[Iteration {records['iteration']}] scheduled training tasks: {training_tasks}, finished training tasks {bin.finished_training_tasks}")
 
                 with self.record_lock:
@@ -201,7 +226,7 @@ class EffiGenTune:
                 if bin.finished_training_tasks == training_tasks:
                     # If the bin has finished all training tasks, we can break the loop
                     break
-            print(f"End training!!!\n")
+            
             # Reset the inference steps count after retraining as the remaining beyond the fixed interval is not counted
             with self.record_lock:
                 records["current_prefills"] -= min(self.inferece_step_size, records["current_prefills"])
@@ -217,6 +242,7 @@ class EffiGenTune:
                 workload="inference",
                 attn_implementation=self.attn_implementation,
                 eval_metrics=True,
+                logger=self.log_with_time,
             )
             if bin is None:
                 # No suitable bin found, continue to the next iteration
@@ -236,6 +262,7 @@ class EffiGenTune:
                 task_queue=task_queues[1], 
                 optimizer=self.optimizer,
                 memory_threshold=self.memory_threshold, 
+                logger=self.log_with_time,
                 **self.kwargs,
             )
         
@@ -247,88 +274,53 @@ class EffiGenTune:
         self,
         task_queues: List[IterQueue],
         preloaded_tasks: List[Task],
-        record_metrics: Dict[str, Any],
+        records: Dict[str, Any],
     ):
         """
         Continuous iteration for retraining tasks.
         """
-        # For sync or async strategy, we only need to check the first queue
-        if task_queues[0].qsize() > 1:  # at least one retraining task (sync) or one task (async)
-            if self.strategy == "async":
-                # For async strategy, we use best-fit allocation to find the best bin for retraining tasks
-                bin, reach_end = self.scheduler.best_fit_allocate(
-                    task_queues[0], 
-                    preloaded_tasks, 
-                    iteration=record_metrics["iteration"],
-                    model=self.model, 
-                    attn_implementation=self.attn_implementation,
-                    eval_metrics=True,
-                    memory_threshold=self.memory_threshold,
-                    task_limit=self.task_limit,
-                )
-            else:  # For sync strategy, we use FIFO allocation to find the best bin for retraining tasks
-                bin, reach_end = self.scheduler.fifo_allocate(
-                    task_queues[0], 
-                    preloaded_tasks, 
-                    iteration=record_metrics["iteration"],
-                    model=self.model, 
-                    max_batch_size=self.max_train_batch_size,
-                    workload="train",
-                    attn_implementation=self.attn_implementation,
-                    eval_metrics=True,
-                )
-            if bin is None:
-                # No suitable bin found, continue to the next iteration
-                return
-            
-            with self.record_lock:
-                record_metrics["tokens"] += bin.get_num_tasks()
-                record_metrics["iteration"] += 1
-                record_metrics["inference_tokens"] += bin.get_num_tasks(target="inference")
+        # For async strategy, we use best-fit allocation to find the best bin for retraining tasks
+        # print(f"\nHybrid batching (total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})")
+        self.log_with_time(f"Hybrid batching (total prefills: {records['total_prefills']}, total retrains: {records['total_trains']})")
+        # decode_only_mode = task_queues[0].decode_size >= self.decode_only_threshold  # priority decode batches
+        bin, reach_end = self.scheduler.best_fit_allocate(
+            task_queues[0], 
+            preloaded_tasks, 
+            iteration=records["iteration"],
+            model=self.model, 
+            attn_implementation=self.attn_implementation,
+            eval_metrics=True,
+            memory_threshold=self.memory_threshold,
+            task_limit=self.task_limit,
+            max_train_batch_size=self.max_train_batch_size,
+            max_inference_batch_size=self.max_inference_batch_size,
+            logger=self.log_with_time,
+            # decode_only=decode_only_mode,  # ✅ 传入 decode-only flag
+        )
+        
+        if bin is None:
+            # No suitable bin found, continue to the next iteration
+            return
+        
+        with self.record_lock:
+            records["tokens"] += bin.get_num_tasks()
+            records["iteration"] += 1
+            records["inference_tokens"] += bin.get_num_tasks(target="inference")
+            records["total_prefills"] += bin.get_num_tasks(target="prefill")
 
-            if self.strategy == "async":
-                bin.concurrent_execute(
-                    model=self.model, 
-                    tokenizer=self.tokenizer, 
-                    task_queue=task_queues[0], 
-                    optimizer=self.optimizer,
-                    memory_threshold=self.memory_threshold, 
-                    **self.kwargs,
-                )
-            else:  # For sync strategy, we execute the training tasks in the bin
-                bin.execute("train", self.model, self.tokenizer, task_queues[0], self.optimizer, memory_threshold=self.memory_threshold, **self.kwargs)
+        bin.concurrent_execute(
+            model=self.model, 
+            tokenizer=self.tokenizer, 
+            task_queue=task_queues[0], 
+            optimizer=self.optimizer,
+            memory_threshold=self.memory_threshold, 
+            logger=self.log_with_time,
+            **self.kwargs,
+        )
 
-        else:  # Otherwise, we run inference tasks (for sync strategy)
-            reach_end = True
-            if self.strategy == "sync":
-                bin, reach_end = self.scheduler.fifo_allocate(
-                    task_queues[1], 
-                    preloaded_tasks, 
-                    iteration=record_metrics["iteration"],
-                    model=self.model, 
-                    max_batch_size=self.max_inference_batch_size,
-                    workload="inference",
-                    attn_implementation=self.attn_implementation,
-                    eval_metrics=True,
-                )
-                if bin is None:
-                    # No suitable bin found, continue to the next iteration
-                    return
-                
-                with self.record_lock:
-                    record_metrics["tokens"] += bin.get_num_tasks()
-                    record_metrics["iteration"] += 1
-                    record_metrics["inference_tokens"] += bin.get_num_tasks(target="inference")
-            
-                bin.concurrent_execute(
-                    model=self.model, 
-                    tokenizer=self.tokenizer, 
-                    task_queue=task_queues[1], 
-                    optimizer=self.optimizer,
-                    memory_threshold=self.memory_threshold, 
-                    **self.kwargs,
-                )
-
+        with self.record_lock:
+            records["total_trains"] += bin.finished_training_tasks
+        
         return reach_end
         
         
@@ -358,20 +350,22 @@ class EffiGenTune:
                 else:
                     reach_end = self.sync_iteration(task_queues, preloaded_tasks, record_metrics)
             except Exception as e:
-                print(f"Error during execution: {e}")
+                # print(f"Error during execution: {e}")
+                logging.error(f"Error during execution: {e}")
                 traceback.print_exc()
                 # If an error occurs, we can break the loop or continue based on the strategy
                 break
 
             if reach_end and all(self.check_termination(task_queue) for task_queue in task_queues): 
                 # Because we always put back the end signal for each queue
-                print("Executor reached the end of the preloaded tasks.")
+                # print("Executor reached the end of the preloaded tasks.")
+                self.log_with_time("Executor reached the end of the preloaded tasks.")
                 break
 
             # for i, q in enumerate(task_queues):
             #     print(f"[Queue {i}] Size: {q.qsize()}, Content: {list(q.queue)}")
-
-        print(f"Execution completed in {record_metrics['iteration']} iterations!")
+        # print(f"Execution completed in {record_metrics['iteration']} iterations!")
+        self.log_with_time(f"Execution completed in {record_metrics['iteration']} iterations!")
         
         
 
@@ -381,24 +375,22 @@ class EffiGenTune:
         Run the system with the given tasks.
         - preloaded_tasks (List[Task]): List of preloaded tasks.
         """
-        def start_priority_refresher(task_queue: IterQueue, preloaded_tasks: List[Task], interval: float = 1.0):
-            def refresher_loop():
-                while True:
-                    with task_queue.mutex:
-                        for i, (priority, workload, taskID) in enumerate(task_queue.queue):
-                            if taskID is not None:
-                                task = preloaded_tasks[taskID]
-                                new_priority = task.get_priority(self.strategy, initial=False)
-                                task_queue.queue[i] = (new_priority, workload, taskID)
-                        heapify(task_queue.queue)
-                    # Print the task queue for debugging
-                    # print(f"  **  Task queue: {[(priority, workload, taskID) for priority, workload, taskID in task_queue.queue]} ** \n")
-                    time.sleep(interval)
+        # def start_priority_refresher(task_queue: IterQueue, preloaded_tasks: List[Task], interval: float = 1.0):
+        #     def refresher_loop():
+        #         while True:
+        #             with task_queue.mutex:
+        #                 for i, (priority, workload, taskID) in enumerate(task_queue.queue):
+        #                     if taskID is not None:
+        #                         task = preloaded_tasks[taskID]
+        #                         new_priority = task.get_priority(self.strategy, initial=False)
+        #                         task_queue.queue[i] = (new_priority, workload, taskID)
+        #                 heapify(task_queue.queue)
+        #             # Print the task queue for debugging
+        #             # print(f"  **  Task queue: {[(priority, workload, taskID) for priority, workload, taskID in task_queue.queue]} ** \n")
+        #             time.sleep(interval)
 
-            thread = threading.Thread(target=refresher_loop, daemon=True)
-            thread.start()
-            # return thread
-
+        #     thread = threading.Thread(target=refresher_loop, daemon=True)
+        #     thread.start()
 
         # Get preloaded tasks
         if preloaded_tasks is None:
@@ -426,17 +418,16 @@ class EffiGenTune:
 
         start = time.time()
 
-        # ✅ Start background refresher (if strategy is async or sync)
-        if self.strategy == "async":
-            for task_queue in task_queues:
-                start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
+        # # Start background refresher (if strategy is async or sync)
+        # if self.strategy == "async":
+        #     for task_queue in task_queues:
+        #         start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Start the producer in a separate thread
             executor.submit(self.producer.produce, task_queues, preloaded_tasks)
 
             # Start the executor in main thread
-            # self.executor(task_queue, preloaded_tasks, record_metrics=record_metrics)
             executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
 
         end = time.time()
@@ -452,21 +443,27 @@ class EffiGenTune:
         inference_tasks = [task for task in preloaded_tasks if task.workload != 'train']
         eval_metrics = self.compute_metrics(inference_tasks)
         train_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'train' and "loss" in task.metrics]
-        # inference_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'inference']
+        TTFTs = [task.decode_times[0] - task.release_time for task in preloaded_tasks if task.workload == "decode" and task.decode_times]
+        TBTs = [(task.decode_times[-1] - task.execution_time) / len(task.decode_times) for task in preloaded_tasks if task.workload == "decode" and task.decode_times]
         metrics = {
+            "strategy": self.strategy,
             "arrival_rate": self.arrival_rate,
             "retrain_rate": self.retrain_rate,
-            "strategy": self.strategy,
             "num_test_samples": self.n_test_samples,
             "executed_samples": {
                 "train": record_metrics["total_trains"], 
                 "inference": record_metrics["total_prefills"],
             },
             "iteration": record_metrics["iteration"],
+            "tokens": record_metrics["tokens"],
+            "inference_tokens": record_metrics["inference_tokens"],
             "total_time": end - start,
+            "TTFT": np.mean(TTFTs) if TTFTs else 0,
+            "TBT": np.mean(TBTs) if TBTs else 0,
             "throughput": record_metrics["tokens"] / (end - start),
             "throughput_inference": record_metrics["inference_tokens"] / (end - start),
             "decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,
+            "training_steps": np.mean([task.step for task in preloaded_tasks if task.workload == 'train']) if any(task.workload == 'train' for task in preloaded_tasks) else 0,
             "train_loss": np.mean(train_losses) if train_losses else 0,
             "eval_metrics": eval_metrics,
             "generation_results": [
@@ -515,12 +512,14 @@ class EffiGenTune:
                 gen_metrics = compute_generation_metrics(
                     hypothesis=task.response, 
                     reference=task.reference,
+                    tokenizer=self.tokenizer,
                 )
                 total_rougeL += gen_metrics["rougeL"]
                 total_bleu += gen_metrics["bleu"]
 
             except KeyError as e:
-                print(f"KeyError: {e} in task {task.taskID}. Skipping this task.")
+                # print(f"KeyError: {e} in task {task.taskID}. Skipping this task.")
+                self.log_with_time(f"KeyError: {e} in task {task.taskID}. Skipping this task.")
                 continue
 
         # Compute final averages
@@ -567,6 +566,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer_threshold", type=float, default=0.5, help="Layer threshold for selective training")
     parser.add_argument("--max_train_batch_size", type=int, default=5, help="Maximum training batch size for LoRA training")
     parser.add_argument("--max_inference_batch_size", type=int, default=50, help="Maximum inference batch size for inference")
+    parser.add_argument("--decode_only_threshold", type=int, default=100, help="Threshold for decode-only mode in async strategy")
     args = parser.parse_args()
     
     
