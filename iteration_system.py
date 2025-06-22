@@ -8,11 +8,14 @@ import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList, MinLengthLogitsProcessor
+import gc
 import sys 
 sys.dont_write_bytecode = True
 import argparse 
 from tqdm import tqdm
+import asyncio
 import threading
+import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from iteration_task import Task  
 from iteration_producer import Producer
@@ -21,6 +24,23 @@ from iteration_queue import IterQueue, heapify
 from iteration_prefix import PrefixManager
 from alignment_study import DPOCollator
 from utils import save_metrics_with_order, compute_generation_metrics
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm import SamplingParams
+
+
+
+def run_experiment(args: argparse.Namespace, experimentID: int):
+
+    # Initialize and run the distributed model
+    system = EffiGenTune(args, experimentID=experimentID)
+    system.run()
+    
+    # Clean up resources explicitly
+    del system
+    torch.cuda.empty_cache()
+    gc.collect()
+
 
 
 
@@ -28,13 +48,13 @@ class EffiGenTune:
     """
     A system for efficiently scheduling concurrent serving & retraining tasks for LLMs on a single GPU.
     """
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, experimentID: Optional[int] = None):
         """
         Initialize the EffiGenTune system.
-        - device (int): GPU device number.
-        - strategy (str): Scheduling strategy ("async" or "sync").
-        - attn_implementation (str): Attention implementation ("flash_attention_2" or "eager").
+        - args (argparse.Namespace): Command line arguments for configuration.
+        - experimentID (int, optional): Identifier for the experiment.
         """
+        self.experimentID = experimentID
         self.device = args.device
         self.cache_optimization = args.cache_optimization
         self.record_lock = threading.Lock()
@@ -42,6 +62,7 @@ class EffiGenTune:
             self.prefix_manager = PrefixManager()
         self.max_train_batch_size = args.max_train_batch_size
         self.max_inference_batch_size = args.max_inference_batch_size
+        self.inference_engine = args.inference_engine
 
         # Handle retraining strategy (steps_per_train)
         self.n_test_samples = args.n_test_samples
@@ -92,9 +113,9 @@ class EffiGenTune:
             self.model_path,
             low_cpu_mem_usage=True,
             torch_dtype=torch.float16,
-            device_map={"": self.device},
+            device_map={"": self.device} if self.inference_engine == "HF" else {"": 'cpu'},
             use_cache=True,
-            attn_implementation=self.attn_implementation,
+            attn_implementation=self.attn_implementation if self.inference_engine == "HF" else "eager",
         )
 
         # Apply LoRA configuration
@@ -107,7 +128,7 @@ class EffiGenTune:
             bias="none"
         )
         self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
+        self.model.print_trainable_parameters() 
         self.max_context_length = self.model.config.max_position_embeddings
 
         # Get producer (loading dataset)
@@ -150,6 +171,7 @@ class EffiGenTune:
             level=logging.INFO,
             format='[%(levelname)s] %(message)s',  # 不用 asctime，提高性能
         )
+        self.log_with_time(f"\n ** Experiment {self.experimentID+1} **\n")
         self.log_with_time(f"[Strategy {self.strategy}] - inference sample {self.n_test_samples}, retrain rate {self.retrain_rate}, inference step size {self.inferece_step_size}\n")
 
 
@@ -158,7 +180,7 @@ class EffiGenTune:
         logging.info(f"[+{elapsed:.2f}s] {msg}")
 
 
-    def check_termination(self, task_queue: IterQueue) -> bool:
+    def check_termination(self, task_queue: IterQueue):
         """
         Check if the task queue has reached the end of the preloaded tasks.
         """
@@ -223,9 +245,14 @@ class EffiGenTune:
                 with self.record_lock:
                     records["total_trains"] += bin.finished_training_tasks
 
-                if bin.finished_training_tasks == training_tasks:
-                    # If the bin has finished all training tasks, we can break the loop
-                    break
+                    if records["total_trains"] >= records["total_prefills"] * self.retrain_rate:
+                        # If the total retraining tasks reach the expected number, we can break the loop
+                        # self.log_with_time(f"Reached expected retraining tasks: {records['total_trains']} >= {records['total_prefills']} * {self.retrain_rate}")
+                        break
+
+                # # If the bin has finished all training tasks, we can break the loop
+                # if bin.finished_training_tasks == training_tasks:
+                #     break
             
             # Reset the inference steps count after retraining as the remaining beyond the fixed interval is not counted
             with self.record_lock:
@@ -367,7 +394,129 @@ class EffiGenTune:
         # print(f"Execution completed in {record_metrics['iteration']} iterations!")
         self.log_with_time(f"Execution completed in {record_metrics['iteration']} iterations!")
         
-        
+    
+    async def vllm_executor(
+        self, 
+        task_queue: asyncio.Queue, 
+        preloaded_tasks: List[Task], 
+        record_metrics: Dict[str, Any],
+        engine: AsyncLLMEngine, 
+        params: SamplingParams,
+    ):
+        while True:
+            _, _, taskID = await task_queue.get()
+
+            if taskID is None:
+                await task_queue.put((float('inf'), None, None))
+                break
+
+            task: Task = preloaded_tasks[taskID]
+            if task.workload == "train":
+                continue
+
+            async for output in engine.generate(
+                prompt=task.prompt,
+                params=params,
+                request_id=str(taskID),
+            ):
+                self.log_with_time(f"[GEN] Task {taskID} output: {output}")
+                if output.finished:
+                    task.response = output.outputs[0].text
+                    self.log_with_time(f"[DONE] Task {taskID}: {task.response}")
+                    break
+
+
+    async def async_run(self, preloaded_tasks: List[Task]):
+
+        task_queues = [asyncio.Queue()] if self.strategy == "async" else [asyncio.Queue(), asyncio.Queue()]
+        record_metrics = {
+            "iteration": 0,
+            "tokens": 0,
+            "inference_tokens": 0,
+            "current_prefills": 0,
+            "total_prefills": 0,
+            "total_trains": 0,
+        }
+
+        engine_args = AsyncEngineArgs(
+            model=self.model_path,
+            tokenizer=None,
+            dtype="float16",
+            tensor_parallel_size=1,
+            device=self.device,
+            enforce_eager=True,
+        )
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        sampling_params = SamplingParams(temperature=0.7, max_tokens=128)
+
+        # loop = asyncio.get_event_loop()
+        # executor = ThreadPoolExecutor(max_workers=1)
+        # loop.run_in_executor(executor, self.producer.produce_async, task_queues, preloaded_tasks)
+
+        # await self.vllm_executor(
+        #     task_queue=task_queues[0],
+        #     preloaded_tasks=preloaded_tasks,
+        #     record_metrics=record_metrics,
+        #     engine=engine,
+        #     params=sampling_params,
+        # )
+        await asyncio.gather(
+            self.producer.produce_async(task_queues, preloaded_tasks),
+            self.vllm_executor(
+                task_queue=task_queues[0],
+                preloaded_tasks=preloaded_tasks,
+                record_metrics=record_metrics,
+                engine=engine,
+                params=sampling_params,
+            )
+        )
+
+
+    # def vllm_executor(
+    #     self, 
+    #     task_queues: List[IterQueue], 
+    #     preloaded_tasks: List[Task], 
+    #     record_metrics: Dict[str, Any],
+    #     engine: AsyncLLMEngine,
+    #     params: SamplingParams,
+    # ):
+    #     task_queue = task_queues[0]  # or both, if dual queues
+    #     active_requests = set()
+
+    #     while True:
+    #         try:
+    #             _, _, taskID = task_queue.get(timeout=0.01)
+    #         except Exception:
+    #             taskID = None
+
+    #         task: Task = preloaded_tasks[taskID]
+    #         if task.workload == "train":    # Skip training tasks in async executor
+    #             continue
+
+    #         # 🔸 Submit 到 engine（并行等待处理）
+    #         engine.add_request(
+    #             request_id=str(taskID),
+    #             inputs=task.prompt,  # one or more prompts
+    #             params=params,  
+    #             arrival_time=task.release_time,  # 任务的释放时间
+    #             priority=task.get_priority(self.strategy, initial=True),  # 初始优先级
+    #         )
+    #         active_requests.add(str(taskID))
+
+    #         # 🔸 获取完成的结果（非阻塞模式）
+    #         results = engine.engine_step()
+    #         for r in results:
+    #             if r.finished and r.request_id in active_requests:
+    #                 task_id = r.request_id
+    #                 output = r.outputs[0].text
+    #                 task = preloaded_tasks[int(task_id)]
+    #                 task.response = output
+    #                 self.log_with_time(f"[DONE] Task {task_id}: {output}")
+    #                 active_requests.remove(task_id)
+                
+    #         # ✅ 退出条件：no new task AND nothing left
+    #         if taskID is None and not active_requests:
+    #             break
 
 
     def run(self, preloaded_tasks: Optional[List[Task]] = None):
@@ -399,46 +548,55 @@ class EffiGenTune:
                 max_length=self.max_context_length,
                 dataset_name=self.data_path,
             )
-
-        # Create iteration bin and execute tasks
-        if self.strategy == "async":
-            task_queues = [IterQueue()]
-        else:
-            # Maintain two queues, first is for retraining, second is for inference
-            task_queues = [IterQueue(), IterQueue()]
-            
-        # Initialize the record metrics
-        record_metrics = {}
-        record_metrics["iteration"] = 0
-        record_metrics["tokens"] = 0
-        record_metrics["inference_tokens"] = 0
-        record_metrics["current_prefills"] = 0
-        record_metrics["total_prefills"] = 0
-        record_metrics["total_trains"] = 0
-
+  
         start = time.time()
-
         # # Start background refresher (if strategy is async or sync)
         # if self.strategy == "async":
         #     for task_queue in task_queues:
         #         start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
+        if self.inference_engine == 'vllm':
+            asyncio.run(self.async_run(preloaded_tasks))
+        else:
+            # Create iteration bin and execute tasks
+            if self.strategy == "async":
+                task_queues = [IterQueue()]
+            else:
+                # Maintain two queues, first is for retraining, second is for inference
+                task_queues = [IterQueue(), IterQueue()]
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # Start the producer in a separate thread
-            executor.submit(self.producer.produce, task_queues, preloaded_tasks)
+            # Initialize the record metrics
+            record_metrics = {}
+            record_metrics["iteration"] = 0
+            record_metrics["tokens"] = 0
+            record_metrics["inference_tokens"] = 0
+            record_metrics["current_prefills"] = 0
+            record_metrics["total_prefills"] = 0
+            record_metrics["total_trains"] = 0
 
-            # Start the executor in main thread
-            executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                # Start the producer in a separate thread
+                executor.submit(self.producer.produce, task_queues, preloaded_tasks)
+
+                # Start the executor in main thread
+                executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
 
         end = time.time()
        
         # Save the task's prompt and response to a file
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
         os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
+        # if self.layer_selection is not None:
+        #     output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}_{self.layer_selection}-{self.layer_threshold}.json")
+        # else:
+        #     output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
         if self.layer_selection is not None:
-            output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}_{self.layer_selection}-{self.layer_threshold}.json")
-        else:
-            output_file = os.path.join(output_dir, f"{self.strategy}_retrain-{self.retrain_rate}_lambda-{self.arrival_rate}.json")
+            output_file = output_file.replace(".json", f"_{self.layer_selection}-{self.layer_threshold}.json")
+        if self.experimentID is not None:
+            self.log_with_time(f"Output file {output_file} (before adding experiment ID)")
+            output_file = output_file.replace(".json", f"_{self.experimentID}.json")
+            self.log_with_time(f"Output file: {output_file}")
+
 
         inference_tasks = [task for task in preloaded_tasks if task.workload != 'train']
         eval_metrics = self.compute_metrics(inference_tasks)
@@ -567,11 +725,18 @@ if __name__ == "__main__":
     parser.add_argument("--max_train_batch_size", type=int, default=5, help="Maximum training batch size for LoRA training")
     parser.add_argument("--max_inference_batch_size", type=int, default=50, help="Maximum inference batch size for inference")
     parser.add_argument("--decode_only_threshold", type=int, default=100, help="Threshold for decode-only mode in async strategy")
+    parser.add_argument("--inference_engine", type=str, default="HF", choices=["HF", "FT", "vllm"], help="Inference engine to use")
+    parser.add_argument('--experiments', type=int, default=1, help='number of experiments')
     args = parser.parse_args()
     
     
-    system = EffiGenTune(args)
-    system.run()
+    # system = EffiGenTune(args)
+    # system.run()
+    if args.inference_engine == 'vllm':
+        mp.set_start_method("spawn", force=True)
+
+    for i in range(args.experiments):
+        run_experiment(args, i)
 
     
 

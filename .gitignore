@@ -8,3 +8,4 @@ data
 eval_metrics*
 scripts
 prefix_cache
+mock_profile

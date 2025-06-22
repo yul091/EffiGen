@@ -2,7 +2,7 @@
 from typing import List, Dict, Any, Optional, Union
 import time
 import random
-import pdb
+import asyncio
 import sys 
 sys.dont_write_bytecode = True
 from datasets import load_dataset, concatenate_datasets
@@ -298,5 +298,24 @@ class Producer:
         for task_queue in task_queues:
             # Signal the end of the dataset
             task_queue.put((float('inf'), None, None))  # Signal the end of the dataset
+        print("Producer finished producing tasks")
+
+
+    async def produce_async(self, task_queues: List[asyncio.Queue], preloaded_tasks: List[Task]):
+        # Produce using the dataset
+        for taskID, task in enumerate(preloaded_tasks):
+            await asyncio.sleep(random.expovariate(task.rate_lambda))
+            if task.workload == "train":
+                # The first queue is always for retraining tasks
+                # print(f"  ====  Producing task {taskID} ({task.workload}) ====  ")
+                await task_queues[0].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
+            else:
+                # The last queue is always for inference tasks
+                await task_queues[-1].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
+            self.log_with_time(f"[PRODUCE] Task {task.taskID} with prompt: {task.prompt}")
+        
+        for task_queue in task_queues:
+            # Signal the end of the dataset
+            await task_queue.put((float('inf'), None, None))
         print("Producer finished producing tasks")
 
