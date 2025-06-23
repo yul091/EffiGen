@@ -316,7 +316,7 @@ if __name__ == "__main__":
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = "meta-llama/Meta-Llama-3-8B-Instruct" 
-    device = 0
+    device = 1
     attn_implementation = "flash_attention_2"  # or "eager" for testing
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", use_fast=True)
     if tokenizer.pad_token is None:
@@ -353,7 +353,7 @@ if __name__ == "__main__":
     
     # Example usage
     prefix_manager = PrefixManager()
-    batch = preloaded_tasks[:3]
+    batch = preloaded_tasks[:5]
     inputs = Bin.create_batch(
         "prefill", batch, tokenizer,
         batch_collator=collator,
@@ -393,7 +393,7 @@ if __name__ == "__main__":
     # inputs = tokenizer(requests, return_tensors="pt", padding=True, truncation=True, max_length=512)
     # shared_cache2, shared_len2 = prefix_manager.get_kv_for_prefix(**inputs)
     # print(f"[INFO] Shared length for request #2: {shared_len2}, KV Cache: {shared_cache2}")
-    batch = preloaded_tasks[3:6]
+    batch = preloaded_tasks[5:9]
     inputs = Bin.create_batch(
         "prefill", batch, tokenizer,
         batch_collator=collator,

@@ -416,38 +416,40 @@ class EffiGenTune:
 
             async for output in engine.generate(
                 prompt=task.prompt,
-                params=params,
+                sampling_params=params,
                 request_id=str(taskID),
-            ):
-                self.log_with_time(f"[GEN] Task {taskID} output: {output}")
+            ):  
+                # self.log_with_time(f"[GEN] Task {taskID} output: {output}")
+                # print("Response:", output.outputs[0].text)
+                # print("Prompt tokens:", output.prompt_token_ids)
+                # print("Completion tokens:", output.metrics["completion_tokens"])
+                # print("Total decode steps (iterations):", output.metrics["total_decode_steps"])
+                # record_metrics["iteration"] = 0
+                # record_metrics["tokens"] = 0
+                # record_metrics["inference_tokens"] = 0
+                # record_metrics["current_prefills"] = 0
+                # record_metrics["total_prefills"] = 0
+                # record_metrics["total_trains"] = 0
                 if output.finished:
+                    self.log_with_time(f"[DONE] Task {taskID}")
                     task.response = output.outputs[0].text
-                    self.log_with_time(f"[DONE] Task {taskID}: {task.response}")
+                    task.step = len(output.outputs[0].token_ids)
+                    record_metrics["tokens"] += task.step
+                    record_metrics["inference_tokens"] += task.step
+                    # self.log_with_time(f"[DONE] Task {taskID}")
                     break
 
 
-    async def async_run(self, preloaded_tasks: List[Task]):
-
-        task_queues = [asyncio.Queue()] if self.strategy == "async" else [asyncio.Queue(), asyncio.Queue()]
-        record_metrics = {
-            "iteration": 0,
-            "tokens": 0,
-            "inference_tokens": 0,
-            "current_prefills": 0,
-            "total_prefills": 0,
-            "total_trains": 0,
-        }
-
-        engine_args = AsyncEngineArgs(
-            model=self.model_path,
-            tokenizer=None,
-            dtype="float16",
-            tensor_parallel_size=1,
-            device=self.device,
-            enforce_eager=True,
-        )
-        engine = AsyncLLMEngine.from_engine_args(engine_args)
-        sampling_params = SamplingParams(temperature=0.7, max_tokens=128)
+    async def async_run(
+        self, 
+        preloaded_tasks: List[Task], 
+        record_metrics: Dict[str, Any],
+        task_queues: List[asyncio.Queue],
+        engine: AsyncLLMEngine,
+        sampling_params: Optional[SamplingParams] = None,
+    ):
+        if sampling_params is None:
+            sampling_params = SamplingParams(temperature=0.7, max_tokens=self.max_new_tokens, top_p=0.95, top_k=50)
 
         # loop = asyncio.get_event_loop()
         # executor = ThreadPoolExecutor(max_workers=1)
@@ -461,62 +463,15 @@ class EffiGenTune:
         #     params=sampling_params,
         # )
         await asyncio.gather(
-            self.producer.produce_async(task_queues, preloaded_tasks),
+            self.producer.produce_async(task_queues, preloaded_tasks, self.log_with_time),
             self.vllm_executor(
-                task_queue=task_queues[0],
+                task_queue=task_queues[-1],
                 preloaded_tasks=preloaded_tasks,
                 record_metrics=record_metrics,
                 engine=engine,
                 params=sampling_params,
             )
         )
-
-
-    # def vllm_executor(
-    #     self, 
-    #     task_queues: List[IterQueue], 
-    #     preloaded_tasks: List[Task], 
-    #     record_metrics: Dict[str, Any],
-    #     engine: AsyncLLMEngine,
-    #     params: SamplingParams,
-    # ):
-    #     task_queue = task_queues[0]  # or both, if dual queues
-    #     active_requests = set()
-
-    #     while True:
-    #         try:
-    #             _, _, taskID = task_queue.get(timeout=0.01)
-    #         except Exception:
-    #             taskID = None
-
-    #         task: Task = preloaded_tasks[taskID]
-    #         if task.workload == "train":    # Skip training tasks in async executor
-    #             continue
-
-    #         # 🔸 Submit 到 engine（并行等待处理）
-    #         engine.add_request(
-    #             request_id=str(taskID),
-    #             inputs=task.prompt,  # one or more prompts
-    #             params=params,  
-    #             arrival_time=task.release_time,  # 任务的释放时间
-    #             priority=task.get_priority(self.strategy, initial=True),  # 初始优先级
-    #         )
-    #         active_requests.add(str(taskID))
-
-    #         # 🔸 获取完成的结果（非阻塞模式）
-    #         results = engine.engine_step()
-    #         for r in results:
-    #             if r.finished and r.request_id in active_requests:
-    #                 task_id = r.request_id
-    #                 output = r.outputs[0].text
-    #                 task = preloaded_tasks[int(task_id)]
-    #                 task.response = output
-    #                 self.log_with_time(f"[DONE] Task {task_id}: {output}")
-    #                 active_requests.remove(task_id)
-                
-    #         # ✅ 退出条件：no new task AND nothing left
-    #         if taskID is None and not active_requests:
-    #             break
 
 
     def run(self, preloaded_tasks: Optional[List[Task]] = None):
@@ -548,39 +503,48 @@ class EffiGenTune:
                 max_length=self.max_context_length,
                 dataset_name=self.data_path,
             )
+
+        # Initialize the record metrics
+        record_metrics = {}
+        record_metrics["iteration"] = 0
+        record_metrics["tokens"] = 0
+        record_metrics["inference_tokens"] = 0
+        record_metrics["current_prefills"] = 0
+        record_metrics["total_prefills"] = 0
+        record_metrics["total_trains"] = 0
   
-        start = time.time()
         # # Start background refresher (if strategy is async or sync)
         # if self.strategy == "async":
         #     for task_queue in task_queues:
         #         start_priority_refresher(task_queue, preloaded_tasks, interval=1.0)
         if self.inference_engine == 'vllm':
-            asyncio.run(self.async_run(preloaded_tasks))
+            task_queues = [asyncio.Queue()] if self.strategy == "async" else [asyncio.Queue(), asyncio.Queue()]
+            engine_args = AsyncEngineArgs(
+                model=self.model_path,
+                tokenizer=self.model_path,
+                dtype="float16",
+                enable_chunked_prefill=True,
+                enable_prefix_caching=self.cache_optimization,
+                tensor_parallel_size=1,
+                device=self.device,
+                enforce_eager=True,
+                max_num_seqs=self.max_inference_batch_size,
+            )
+            engine = AsyncLLMEngine.from_engine_args(engine_args)
+            start = time.time()
+            asyncio.run(self.async_run(preloaded_tasks, record_metrics, task_queues, engine))
+            end = time.time()
         else:
-            # Create iteration bin and execute tasks
-            if self.strategy == "async":
-                task_queues = [IterQueue()]
-            else:
-                # Maintain two queues, first is for retraining, second is for inference
-                task_queues = [IterQueue(), IterQueue()]
-
-            # Initialize the record metrics
-            record_metrics = {}
-            record_metrics["iteration"] = 0
-            record_metrics["tokens"] = 0
-            record_metrics["inference_tokens"] = 0
-            record_metrics["current_prefills"] = 0
-            record_metrics["total_prefills"] = 0
-            record_metrics["total_trains"] = 0
-
+            # Create iteration bin and execute tasks (first is for retraining, second is for inference)
+            task_queues = [IterQueue()] if self.strategy == "async" else [IterQueue(), IterQueue()]
+            start = time.time()
             with ThreadPoolExecutor(max_workers=2) as executor:
                 # Start the producer in a separate thread
                 executor.submit(self.producer.produce, task_queues, preloaded_tasks)
 
                 # Start the executor in main thread
                 executor.submit(self.executor, task_queues, preloaded_tasks, record_metrics=record_metrics)
-
-        end = time.time()
+            end = time.time()
        
         # Save the task's prompt and response to a file
         output_dir = os.path.join(self.output_dir, self.model_path.split("/")[-1])
@@ -661,11 +625,11 @@ class EffiGenTune:
             eval_outputs = task.metrics
             try:
                 total_samples += 1
-                total_loss += eval_outputs["loss"]
-                total_correct += eval_outputs["correct_preds"]
-                total_log_prob_diff += eval_outputs["log_prob_diff"]
+                total_loss += eval_outputs.get("loss", 0.0)
+                total_correct += eval_outputs.get("correct_preds", 0)
+                total_log_prob_diff += eval_outputs.get("log_prob_diff", 0.0)
                 # Generation metrics
-                ppl = eval_outputs["nll_sum"] / task.step if task.step > 0 else 0
+                ppl = eval_outputs.get("nll_sum", 0.0) / task.step if task.step > 0 else 0
                 total_perplexity += np.exp(ppl)
                 gen_metrics = compute_generation_metrics(
                     hypothesis=task.response, 

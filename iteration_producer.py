@@ -1,5 +1,5 @@
 # A definition of the Producer class and supported functions.
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Callable
 import time
 import random
 import asyncio
@@ -301,7 +301,7 @@ class Producer:
         print("Producer finished producing tasks")
 
 
-    async def produce_async(self, task_queues: List[asyncio.Queue], preloaded_tasks: List[Task]):
+    async def produce_async(self, task_queues: List[asyncio.Queue], preloaded_tasks: List[Task], logger: Optional[Callable] = None):
         # Produce using the dataset
         for taskID, task in enumerate(preloaded_tasks):
             await asyncio.sleep(random.expovariate(task.rate_lambda))
@@ -312,10 +312,12 @@ class Producer:
             else:
                 # The last queue is always for inference tasks
                 await task_queues[-1].put((task.get_priority(self.strategy, initial=True), task.workload, taskID))
-            self.log_with_time(f"[PRODUCE] Task {task.taskID} with prompt: {task.prompt}")
+            if logger is not None:
+                logger(f"[PRODUCE] Task {task.taskID} ({task.workload})")
         
         for task_queue in task_queues:
             # Signal the end of the dataset
             await task_queue.put((float('inf'), None, None))
-        print("Producer finished producing tasks")
+        if logger is not None:
+            logger("Producer finished producing tasks")
 
