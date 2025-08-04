@@ -53,6 +53,7 @@ class Task:
         self.step = 0
         self.release_time = None
         self.execution_time = None
+        self.finish_time = None    # for training tasks
         self.decode_times = []
         self.response = ""
         self.metrics = {}

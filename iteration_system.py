@@ -567,6 +567,7 @@ class EffiGenTune:
         train_losses = [task.metrics["loss"] for task in preloaded_tasks if task.workload == 'train' and "loss" in task.metrics]
         TTFTs = [task.decode_times[0] - task.release_time for task in preloaded_tasks if task.workload == "decode" and task.decode_times]
         TBTs = [(task.decode_times[-1] - task.execution_time) / len(task.decode_times) for task in preloaded_tasks if task.workload == "decode" and task.decode_times]
+        FTs = [task.finish_time - task.execution_time for task in preloaded_tasks if task.workload == "train" and task.finish_time is not None]
         metrics = {
             "strategy": self.strategy,
             "arrival_rate": self.arrival_rate,
@@ -582,6 +583,7 @@ class EffiGenTune:
             "total_time": end - start,
             "TTFT": np.mean(TTFTs) if TTFTs else 0,
             "TBT": np.mean(TBTs) if TBTs else 0,
+            "FT": np.mean(FTs) if FTs else 0,
             "throughput": record_metrics["tokens"] / (end - start),
             "throughput_inference": record_metrics["inference_tokens"] / (end - start),
             "decoding_steps": np.mean([task.step for task in preloaded_tasks if task.workload != 'train']) if any(task.workload != 'train' for task in preloaded_tasks) else 0,

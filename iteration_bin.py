@@ -390,7 +390,8 @@ class Bin:
                 else:
                     losses.mean().backward()
                     optimizer.step()
-
+                
+                finish_time = time.time()
                 # Update task status
                 for i, task in enumerate(batch):
                     task.metrics["loss"] = losses[i].item()
@@ -403,6 +404,7 @@ class Bin:
                         print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (put back for retraining)")
                     else:
                         self.finished_training_tasks += 1
+                        task.finish_time = finish_time
                         print(f"Task {task.taskID} ({task.workload}) with loss {task.metrics['loss']} (finished)") 
 
                 # # Release memory
@@ -463,6 +465,7 @@ class Bin:
                 del outputs, inputs, model_kwargs, model_inputs
 
         except Exception as e:
+            finish_time = time.time()
             if logger is not None:
                 logger(f"Error during {workload} execution (stats {self.workload_stats[workload]}): {e}")
             for task in batch:
@@ -470,6 +473,8 @@ class Bin:
                     task.execution_time = execution_time
                 if task.workload != "train":
                     task.get_response(tokenizer)
+                else:
+                    task.finish_time = finish_time
                 task.metrics["error"] = str(e)
 
         # Clear the batch
